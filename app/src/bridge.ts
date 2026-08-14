@@ -37,7 +37,19 @@ export class Bridge {
     }
 
     this.isProcessing = true;
-    const streamer = new Streamer(this.api, chatId);
+
+    // Instant acknowledgment so the user sees the request was accepted right
+    // away, even before Claude produces its first token. The streamer then
+    // edits THIS message in place as the answer streams in (no extra clutter).
+    let ackMessageId: number | undefined;
+    try {
+      const ack = await this.api.sendMessage(chatId, "⏳ Взял в работу…");
+      ackMessageId = ack.message_id;
+    } catch {
+      // If the ack fails, the streamer just sends its own first message.
+    }
+
+    const streamer = new Streamer(this.api, chatId, ackMessageId);
 
     try {
       let promptInput: any;

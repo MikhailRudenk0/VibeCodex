@@ -1,5 +1,25 @@
 node_modules/
 dist/
 .env
+.env.*
 .claude/
 *.tsbuildinfo
+
+# Logs
+*.log
+
+# Lock files (vibeide process locks)
+*.lock
+
+# Whisper models
+models/
+
+# Binary tools
+bin/
+
+# Python venv
+.venv/
+
+# Runtime scripts (local)
+run-*.sh
+restart.sh

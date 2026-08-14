@@ -1,4 +1,9 @@
-import { Bot, InlineKeyboard, type Context } from "grammy";
+import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
+import { exec } from "child_process";
+import { createReadStream } from "fs";
+import { writeFile, unlink, stat } from "fs/promises";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import type { Config } from "./config.js";
 import { Bridge } from "./bridge.js";
 import {
@@ -6,6 +11,31 @@ import {
   formatRelativeTime,
   type ProjectInfo,
 } from "./projects.js";
+
+function transcribeAudio(audioPath: string): Promise<string> {
+  // Resolve transcribe.sh relative to the project root (two levels up from app/src/)
+  const projectRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const script = join(projectRoot, "bin", "transcribe.sh");
+
+  return new Promise((resolve, reject) => {
+    exec(
+      `"${script}" "${audioPath}"`,
+      { timeout: 120_000 },
+      (err, stdout, stderr) => {
+        if (err) {
+          reject(new Error(`Transcription failed: ${stderr || err.message}`));
+        } else {
+          const text = stdout.trim();
+          if (!text) {
+            reject(new Error("Transcription returned empty result"));
+          } else {
+            resolve(text);
+          }
+        }
+      }
+    );
+  });
+}
 
 export async function createBot(config: Config, initialProjectPath?: string): Promise<Bot> {
   const bot = new Bot(config.telegramBotToken);
@@ -19,14 +49,14 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
   // Auth middleware — silently drop unauthorized users
   bot.use(async (ctx, next) => {
-    if (ctx.from?.id !== config.allowedUserId) return;
+    if (!ctx.from?.id || !config.allowedUserIds.includes(ctx.from.id)) return;
     await next();
   });
 
   // /start command
   bot.command("start", async (ctx) => {
     await ctx.reply(
-      `VibeIDE connected.\nProject: \`${bridge.projectPath}\`\n\nCommands:\n/projects — list projects\n/switch — change project\n/new — fresh session\n/status — current state`,
+      `VibeIDE connected.\nProject: \`${bridge.projectPath}\`\n\nCommands:\n/projects — list projects\n/switch — change project\n/new — fresh session\n/status — current state\n/file <path> — send a file`,
       { parse_mode: "Markdown" }
     );
   });
@@ -46,6 +76,46 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   bot.command("new", async (ctx) => {
     bridge.clearSession();
     await ctx.reply("Session cleared. Next message starts a fresh conversation.");
+  });
+
+  // /file command — send a file from the server to Telegram
+  bot.command("file", async (ctx) => {
+    const args = ctx.message?.text?.slice("/file".length).trim();
+    if (!args) {
+      await ctx.reply("Usage: `/file <path>`\nExample: `/file presentation.pdf`", { parse_mode: "Markdown" });
+      return;
+    }
+
+    // Resolve relative paths from the current project directory
+    const filePath = args.startsWith("/") ? args : join(bridge.projectPath, args);
+
+    let fileStats;
+    try {
+      fileStats = await stat(filePath);
+    } catch {
+      await ctx.reply(`File not found: \`${filePath}\``, { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (fileStats.isDirectory()) {
+      await ctx.reply("Cannot send a directory. Specify a file path.");
+      return;
+    }
+
+    // Telegram bot API limit: 50 MB
+    const sizeMB = fileStats.size / (1024 * 1024);
+    if (sizeMB > 50) {
+      await ctx.reply(`File too large (${sizeMB.toFixed(1)} MB). Telegram limit is 50 MB.`);
+      return;
+    }
+
+    try {
+      const fileName = filePath.split("/").pop() || "file";
+      await ctx.replyWithDocument(new InputFile(createReadStream(filePath), fileName));
+    } catch (err: any) {
+      console.error("Failed to send file:", err);
+      await ctx.reply(`Failed to send file: ${err.message}`);
+    }
   });
 
   // /projects command — list available projects
@@ -132,6 +202,41 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     await bridge.sendMessage(ctx.chat.id, caption, [
       { data: base64, mediaType },
     ]);
+  });
+
+  // Handle voice messages — transcribe via whisper.cpp, then forward text to Claude
+  bot.on("message:voice", async (ctx) => {
+    const voice = ctx.message.voice;
+    const file = await ctx.api.getFile(voice.file_id);
+
+    if (!file.file_path) {
+      await ctx.reply("Could not download voice message.");
+      return;
+    }
+
+    // Download the .oga file to a temp location
+    const url = `https://api.telegram.org/file/bot${config.telegramBotToken}/${file.file_path}`;
+    const response = await fetch(url);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const tmpPath = `/tmp/vibeide-voice-${Date.now()}.oga`;
+
+    try {
+      await writeFile(tmpPath, buffer);
+
+      // Transcribe via whisper.cpp (ffmpeg converts oga→wav internally)
+      const text = await transcribeAudio(tmpPath);
+      console.log(`Voice transcribed (${voice.duration}s): ${text.slice(0, 80)}...`);
+
+      // Show the user what was recognized so they can verify
+      await ctx.reply(`🎤 _${text}_`, { parse_mode: "Markdown" });
+
+      await bridge.sendMessage(ctx.chat.id, text);
+    } catch (err: any) {
+      console.error("Voice transcription error:", err);
+      await ctx.reply(`Не удалось распознать голос: ${err.message}`);
+    } finally {
+      await unlink(tmpPath).catch(() => {});
+    }
   });
 
   // Handle text messages — forward to Claude
