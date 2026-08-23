@@ -3,11 +3,20 @@ import type { Api, RawApi } from "grammy";
 import { Streamer } from "./streamer.js";
 import { findLatestSessionId } from "./projects.js";
 
+interface QueuedMessage {
+  chatId: number;
+  text: string;
+  images?: { data: string; mediaType: string }[];
+}
+
 export class Bridge {
   projectPath: string;
   sessionId: string | undefined;
   private isProcessing = false;
   private api: Api<RawApi>;
+  private currentQuery: ReturnType<typeof query> | null = null;
+  private currentStreamer: Streamer | null = null;
+  private pendingMessage: QueuedMessage | null = null;
 
   constructor(api: Api<RawApi>, projectPath?: string) {
     this.api = api;
@@ -23,15 +32,37 @@ export class Bridge {
     this.sessionId = undefined;
   }
 
+  async stop(): Promise<boolean> {
+    if (!this.currentQuery || !this.isProcessing) return false;
+    try {
+      await this.currentQuery.interrupt();
+    } catch {
+      // interrupt may throw if already finished
+    }
+    if (this.currentStreamer) {
+      await this.currentStreamer.append("\n\n⛔ Остановлено");
+      await this.currentStreamer.finalize();
+    }
+    this.currentQuery = null;
+    this.currentStreamer = null;
+    this.isProcessing = false;
+    return true;
+  }
+
   async sendMessage(
     chatId: number,
     text: string,
     images?: { data: string; mediaType: string }[]
   ): Promise<void> {
     if (this.isProcessing) {
+      // Queue the message — only keep the latest one (newer replaces older)
+      const hadPending = this.pendingMessage !== null;
+      this.pendingMessage = { chatId, text, images };
       await this.api.sendMessage(
         chatId,
-        "Still thinking on your last message... please wait."
+        hadPending
+          ? "⏳ Заменил предыдущее ожидающее сообщение. Приступлю, когда закончу текущее."
+          : "⏳ Принял. Приступлю, когда закончу текущее."
       );
       return;
     }
@@ -50,6 +81,7 @@ export class Bridge {
     }
 
     const streamer = new Streamer(this.api, chatId, ackMessageId);
+    this.currentStreamer = streamer;
 
     try {
       let promptInput: any;
@@ -86,7 +118,7 @@ export class Bridge {
         promptInput = text;
       }
 
-      const conversation = query({
+      this.currentQuery = query({
         prompt: promptInput,
         options: {
           cwd: this.projectPath,
@@ -109,7 +141,7 @@ export class Bridge {
         },
       });
 
-      for await (const message of conversation) {
+      for await (const message of this.currentQuery) {
         // Capture session ID from any message
         if ("session_id" in message && message.session_id) {
           this.sessionId = message.session_id;
@@ -140,7 +172,18 @@ export class Bridge {
       await streamer.append(`\n\nBridge error: ${err.message || err}`);
     } finally {
       await streamer.finalize();
+      this.currentQuery = null;
+      this.currentStreamer = null;
       this.isProcessing = false;
+
+      // Process queued message if any
+      const next = this.pendingMessage;
+      if (next) {
+        this.pendingMessage = null;
+        this.sendMessage(next.chatId, next.text, next.images).catch((err) => {
+          console.error("Queued sendMessage error:", err);
+        });
+      }
     }
   }
 }

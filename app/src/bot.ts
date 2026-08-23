@@ -56,7 +56,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   // /start command
   bot.command("start", async (ctx) => {
     await ctx.reply(
-      `VibeIDE connected.\nProject: \`${bridge.projectPath}\`\n\nCommands:\n/projects — list projects\n/switch — change project\n/new — fresh session\n/status — current state\n/file <path> — send a file`,
+      `VibeIDE connected.\nProject: \`${bridge.projectPath}\`\n\nCommands:\n/projects — list projects\n/switch — change project\n/new — fresh session\n/stop — interrupt current task\n/status — current state\n/file <path> — send a file`,
       { parse_mode: "Markdown" }
     );
   });
@@ -70,6 +70,30 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       `Project: \`${bridge.projectPath}\`\nSession: ${sessionInfo}`,
       { parse_mode: "Markdown" }
     );
+  });
+
+  // /help command
+  bot.command("help", async (ctx) => {
+    await ctx.reply(
+      `*Команды:*\n` +
+      `/help — это сообщение\n` +
+      `/stop — остановить текущую задачу\n` +
+      `/new — новая сессия (сброс контекста)\n` +
+      `/status — текущий проект и сессия\n` +
+      `/projects — список проектов\n` +
+      `/switch — переключить проект\n` +
+      `/file <путь> — скачать файл с сервера\n\n` +
+      `Поддерживает: текст, голос, фото.`,
+      { parse_mode: "Markdown" }
+    );
+  });
+
+  // /stop command — interrupt the running Claude query
+  bot.command("stop", async (ctx) => {
+    const stopped = await bridge.stop();
+    if (!stopped) {
+      await ctx.reply("Нечего останавливать.");
+    }
   });
 
   // /new command — fresh session, same project
@@ -199,9 +223,11 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     const mediaType = mediaTypeMap[ext] || "image/jpeg";
 
     const caption = ctx.message.caption || "What do you see in this image?";
-    await bridge.sendMessage(ctx.chat.id, caption, [
+    bridge.sendMessage(ctx.chat.id, caption, [
       { data: base64, mediaType },
-    ]);
+    ]).catch((err) => {
+      console.error("sendMessage error:", err);
+    });
   });
 
   // Handle voice messages — transcribe via whisper.cpp, then forward text to Claude
@@ -230,7 +256,9 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       // Show the user what was recognized so they can verify
       await ctx.reply(`🎤 _${text}_`, { parse_mode: "Markdown" });
 
-      await bridge.sendMessage(ctx.chat.id, text);
+      bridge.sendMessage(ctx.chat.id, text).catch((err) => {
+        console.error("sendMessage error:", err);
+      });
     } catch (err: any) {
       console.error("Voice transcription error:", err);
       await ctx.reply(`Не удалось распознать голос: ${err.message}`);
@@ -240,10 +268,14 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   });
 
   // Handle text messages — forward to Claude
+  // NOTE: sendMessage is NOT awaited so the handler returns immediately,
+  // allowing Grammy to process the next update (e.g. /stop) without waiting.
   bot.on("message:text", async (ctx) => {
     const text = ctx.message.text;
     if (!text || text.startsWith("/")) return; // Skip unhandled commands
-    await bridge.sendMessage(ctx.chat.id, text);
+    bridge.sendMessage(ctx.chat.id, text).catch((err) => {
+      console.error("sendMessage error:", err);
+    });
   });
 
   return bot;
