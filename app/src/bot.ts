@@ -41,10 +41,17 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   const bot = new Bot(config.telegramBotToken);
   const bridge = new Bridge(bot.api, initialProjectPath);
 
-  // Auto-resume the latest session for this project
-  const resumedId = await bridge.resumeLatestSession();
-  if (resumedId) {
-    console.log(`Resuming session: ${resumedId.slice(0, 8)}...`);
+  // Restore saved state (survives OOM restarts), fall back to session discovery
+  const saved = await Bridge.loadState();
+  if (saved) {
+    bridge.projectPath = saved.projectPath;
+    bridge.sessionId = saved.sessionId;
+    console.log(`Restored state: project=${saved.projectPath}, session=${saved.sessionId.slice(0, 8)}...`);
+  } else {
+    const resumedId = await bridge.resumeLatestSession();
+    if (resumedId) {
+      console.log(`Resuming session: ${resumedId.slice(0, 8)}...`);
+    }
   }
 
   // Auth middleware — silently drop unauthorized users
@@ -182,6 +189,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     const projectPath = ctx.callbackQuery.data.slice("switch:".length);
     bridge.projectPath = projectPath;
     const resumedId = await bridge.resumeLatestSession();
+    bridge.saveState();
     const name = projectPath.split("/").filter(Boolean).pop() || projectPath;
     await ctx.answerCallbackQuery();
     const sessionNote = resumedId

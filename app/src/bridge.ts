@@ -1,7 +1,13 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Api, RawApi } from "grammy";
+import { writeFile, readFile, mkdir } from "fs/promises";
+import { join } from "path";
+import { homedir } from "os";
 import { Streamer } from "./streamer.js";
 import { findLatestSessionId } from "./projects.js";
+
+const STATE_DIR = join(homedir(), ".local", "state", "vibeide");
+const STATE_FILE = join(STATE_DIR, "state.json");
 
 interface QueuedMessage {
   chatId: number;
@@ -30,6 +36,22 @@ export class Bridge {
 
   clearSession(): void {
     this.sessionId = undefined;
+    this.saveState();
+  }
+
+  static async loadState(): Promise<{ sessionId: string; projectPath: string } | null> {
+    try {
+      const data = JSON.parse(await readFile(STATE_FILE, "utf-8"));
+      if (data.sessionId && data.projectPath) return data;
+    } catch {}
+    return null;
+  }
+
+  saveState(): void {
+    const data = JSON.stringify({ sessionId: this.sessionId, projectPath: this.projectPath });
+    mkdir(STATE_DIR, { recursive: true })
+      .then(() => writeFile(STATE_FILE, data))
+      .catch(() => {});
   }
 
   async stop(): Promise<boolean> {
@@ -145,6 +167,7 @@ export class Bridge {
         // Capture session ID from any message
         if ("session_id" in message && message.session_id) {
           this.sessionId = message.session_id;
+          this.saveState();
         }
 
         if (message.type === "assistant" && message.message) {
