@@ -150,10 +150,13 @@ Start a fresh conversation anytime with `/new`.
 ## Features
 
 - **Full Claude Code agent** — Read, Edit, Write, Bash, Glob, Grep, WebSearch, WebFetch, and Task (subagents)
+- **Model switching** — `/model` to pick from available models (Fable, Opus, Sonnet, Haiku) mid-session
+- **Effort control** — `/effort` to adjust reasoning depth (low → max), trades speed for quality
 - **Streaming responses** — messages update live on Telegram as Claude thinks
 - **Seamless handoff** — auto-resumes your latest Claude Code session, pick up on Telegram where you left off in VS Code
 - **Project switching** — jump between any project in `~/.claude/projects/` without restarting
 - **Image support** — send photos, screenshots, diagrams for Claude to analyze
+- **Voice messages** — transcribes voice via whisper.cpp and forwards to Claude
 - **Long response splitting** — auto-splits at ~3800 chars, well under Telegram's 4096 limit
 - **Markdown rendering** — code blocks, bold, inline code, with plain-text fallback
 - **Single user auth** — only your Telegram account can talk to the bot
@@ -180,10 +183,14 @@ Single process. ~300 lines of TypeScript. No moving parts.
 
 | Command     | What it does                                                   |
 | ----------- | -------------------------------------------------------------- |
+| `/model`    | Switch Claude model (Fable, Opus, Sonnet, Haiku) via picker    |
+| `/effort`   | Set reasoning effort level (low / medium / high / xhigh / max) |
 | `/projects` | List your recent Claude Code projects, sorted by last activity |
 | `/switch`   | Change active project via inline keyboard picker               |
 | `/new`      | Start a fresh conversation (same project, clears session)      |
-| `/status`   | Show current project path and session info                     |
+| `/stop`     | Interrupt the currently running task                           |
+| `/status`   | Show current project, session, model, and effort info          |
+| `/file`     | Download a file from the server to Telegram                    |
 
 Everything else you type — text or photos — is sent directly to Claude.
 
@@ -240,6 +247,7 @@ This is the same trust model as running Claude Code in your terminal — because
 ## Requirements
 
 - Node.js >= 18
+- [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) >= 0.3.x (installed automatically via `npm install`)
 - Claude Code installed and logged in (`claude login`), or an [Anthropic API key](https://console.anthropic.com/)
 - A Telegram account + bot token from [@BotFather](https://t.me/BotFather)
 

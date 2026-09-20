@@ -6,11 +6,20 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import type { Config } from "./config.js";
 import { Bridge } from "./bridge.js";
+import type { EffortLevel } from "./bridge.js";
 import {
   listProjects,
   formatRelativeTime,
   type ProjectInfo,
 } from "./projects.js";
+
+const EFFORT_LEVELS: { value: EffortLevel; label: string; desc: string }[] = [
+  { value: "low",    label: "🟢 Low",    desc: "Fast, minimal thinking" },
+  { value: "medium", label: "🟡 Medium", desc: "Balanced" },
+  { value: "high",   label: "🟠 High",   desc: "Deep reasoning (default)" },
+  { value: "xhigh",  label: "🔴 XHigh",  desc: "Extended, for hard tasks" },
+  { value: "max",    label: "⚫ Max",    desc: "Maximum, no limits" },
+];
 
 function transcribeAudio(audioPath: string): Promise<string> {
   // Resolve transcribe.sh relative to the project root (two levels up from app/src/)
@@ -46,7 +55,9 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   if (saved) {
     bridge.projectPath = saved.projectPath;
     bridge.sessionId = saved.sessionId;
-    console.log(`Restored state: project=${saved.projectPath}, session=${saved.sessionId.slice(0, 8)}...`);
+    if (saved.model) bridge.model = saved.model;
+    if (saved.effort) bridge.effort = saved.effort;
+    console.log(`Restored state: project=${saved.projectPath}, session=${saved.sessionId.slice(0, 8)}..., model=${saved.model || 'default'}, effort=${saved.effort || 'default'}`);
   } else {
     const resumedId = await bridge.resumeLatestSession();
     if (resumedId) {
@@ -81,8 +92,10 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     const sessionInfo = bridge.sessionId
       ? `\`${bridge.sessionId.slice(0, 8)}...\``
       : "none (will start on next message)";
+    const modelInfo = bridge.model || "default";
+    const effortInfo = bridge.effort || "default (high)";
     await ctx.reply(
-      `Project: \`${bridge.projectPath}\`\nSession: ${sessionInfo}`,
+      `Project: \`${bridge.projectPath}\`\nSession: ${sessionInfo}\nModel: \`${modelInfo}\`\nEffort: \`${effortInfo}\``,
       { parse_mode: "Markdown" }
     );
   });
@@ -95,12 +108,69 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       `/stop — остановить текущую задачу\n` +
       `/new — новая сессия (сброс контекста)\n` +
       `/status — текущий проект и сессия\n` +
+      `/model — выбрать модель\n` +
+      `/effort — уровень усилий\n` +
       `/projects — список проектов\n` +
       `/switch — переключить проект\n` +
       `/file <путь> — скачать файл с сервера\n\n` +
       `Поддерживает: текст, голос, фото.`,
       { parse_mode: "Markdown" }
     );
+  });
+
+  // /model command — show model picker
+  bot.command("model", async (ctx) => {
+    const models = await bridge.getSupportedModels();
+    if (models.length === 0) {
+      await ctx.reply(
+        "Модели недоступны. Отправь любое сообщение чтобы начать сессию, затем попробуй снова."
+      );
+      return;
+    }
+
+    const keyboard = new InlineKeyboard();
+    for (const m of models) {
+      const current = bridge.model === m.value ? " ✓" : "";
+      keyboard.text(`${m.displayName}${current}`, `model:${m.value}`).row();
+    }
+
+    await ctx.reply("Выбери модель:", { reply_markup: keyboard });
+  });
+
+  // Handle model selection callback
+  bot.callbackQuery(/^model:/, async (ctx) => {
+    const modelValue = ctx.callbackQuery.data.slice("model:".length);
+    const ok = await bridge.setModel(modelValue);
+    await ctx.answerCallbackQuery();
+    if (ok) {
+      await ctx.editMessageText(`Модель: \`${modelValue}\``, { parse_mode: "Markdown" });
+    } else {
+      await ctx.editMessageText(`Не удалось переключить модель на \`${modelValue}\``, { parse_mode: "Markdown" });
+    }
+  });
+
+  // /effort command — show effort level picker
+  bot.command("effort", async (ctx) => {
+    const keyboard = new InlineKeyboard();
+    for (const e of EFFORT_LEVELS) {
+      const current = bridge.effort === e.value ? " ✓" : "";
+      keyboard.text(`${e.label}${current}`, `effort:${e.value}`).row();
+    }
+
+    await ctx.reply("Уровень усилий:", { reply_markup: keyboard });
+  });
+
+  // Handle effort selection callback
+  bot.callbackQuery(/^effort:/, async (ctx) => {
+    const effortValue = ctx.callbackQuery.data.slice("effort:".length) as EffortLevel;
+    const ok = await bridge.setEffort(effortValue);
+    await ctx.answerCallbackQuery();
+    const info = EFFORT_LEVELS.find((e) => e.value === effortValue);
+    if (ok && info) {
+      await ctx.editMessageText(`Effort: ${info.label} — ${info.desc}`, { parse_mode: "Markdown" });
+    } else {
+      await ctx.editMessageText(`Не удалось установить effort: \`${effortValue}\``, { parse_mode: "Markdown" });
+    }
   });
 
   // /stop command — interrupt the running Claude query

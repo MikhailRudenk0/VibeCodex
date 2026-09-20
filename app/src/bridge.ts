@@ -1,4 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { ModelInfo, EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { Api, RawApi } from "grammy";
 import { writeFile, readFile, mkdir } from "fs/promises";
 import { join } from "path";
@@ -15,9 +16,14 @@ interface QueuedMessage {
   images?: { data: string; mediaType: string }[];
 }
 
+export type { ModelInfo, EffortLevel };
+
 export class Bridge {
   projectPath: string;
   sessionId: string | undefined;
+  model: string | undefined;
+  effort: EffortLevel | undefined;
+  private cachedModels: ModelInfo[] = [];
   private isProcessing = false;
   private api: Api<RawApi>;
   private currentQuery: ReturnType<typeof query> | null = null;
@@ -39,7 +45,12 @@ export class Bridge {
     this.saveState();
   }
 
-  static async loadState(): Promise<{ sessionId: string; projectPath: string } | null> {
+  static async loadState(): Promise<{
+    sessionId: string;
+    projectPath: string;
+    model?: string;
+    effort?: EffortLevel;
+  } | null> {
     try {
       const data = JSON.parse(await readFile(STATE_FILE, "utf-8"));
       if (data.sessionId && data.projectPath) return data;
@@ -48,10 +59,54 @@ export class Bridge {
   }
 
   saveState(): void {
-    const data = JSON.stringify({ sessionId: this.sessionId, projectPath: this.projectPath });
+    const data = JSON.stringify({
+      sessionId: this.sessionId,
+      projectPath: this.projectPath,
+      model: this.model,
+      effort: this.effort,
+    });
     mkdir(STATE_DIR, { recursive: true })
       .then(() => writeFile(STATE_FILE, data))
       .catch(() => {});
+  }
+
+  async getSupportedModels(): Promise<ModelInfo[]> {
+    if (this.cachedModels.length > 0) return this.cachedModels;
+    if (!this.currentQuery) return [];
+    try {
+      this.cachedModels = await this.currentQuery.supportedModels();
+      return this.cachedModels;
+    } catch {
+      return [];
+    }
+  }
+
+  async setModel(model: string): Promise<boolean> {
+    this.model = model;
+    this.saveState();
+    if (this.currentQuery) {
+      try {
+        await this.currentQuery.setModel(model);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  async setEffort(effort: EffortLevel): Promise<boolean> {
+    this.effort = effort;
+    this.saveState();
+    if (this.currentQuery) {
+      try {
+        await this.currentQuery.applyFlagSettings({ effortLevel: effort });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return true;
   }
 
   async stop(): Promise<boolean> {
@@ -145,6 +200,8 @@ export class Bridge {
         options: {
           cwd: this.projectPath,
           ...(this.sessionId ? { resume: this.sessionId } : {}),
+          ...(this.model ? { model: this.model } : {}),
+          ...(this.effort ? { effort: this.effort } : {}),
           allowedTools: [
             "Read",
             "Edit",
@@ -162,6 +219,12 @@ export class Bridge {
           settingSources: ["project"],
         },
       });
+
+      if (this.cachedModels.length === 0) {
+        this.currentQuery.supportedModels().then((models) => {
+          this.cachedModels = models;
+        }).catch(() => {});
+      }
 
       for await (const message of this.currentQuery) {
         // Capture session ID from any message
