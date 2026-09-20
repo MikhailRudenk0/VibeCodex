@@ -54,6 +54,14 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     }
   }
 
+  // Global error handler — prevents crashes from unhandled errors
+  bot.catch((err) => {
+    const ctx = err.ctx;
+    const e = err.error;
+    const updateId = ctx.update.update_id;
+    console.error(`Error handling update ${updateId}:`, e);
+  });
+
   // Auth middleware — silently drop unauthorized users
   bot.use(async (ctx, next) => {
     if (!ctx.from?.id || !config.allowedUserIds.includes(ctx.from.id)) return;
@@ -172,7 +180,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     }
 
     const keyboard = new InlineKeyboard();
-    for (const project of projects.slice(0, 10)) {
+    for (const project of projects.slice(0, 20)) {
       keyboard
         .text(
           `${project.name} (${formatRelativeTime(project.lastActivity)})`,
@@ -241,7 +249,23 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   // Handle voice messages — transcribe via whisper.cpp, then forward text to Claude
   bot.on("message:voice", async (ctx) => {
     const voice = ctx.message.voice;
-    const file = await ctx.api.getFile(voice.file_id);
+
+    // getFile can fail with 504 Gateway Timeout for large/slow files — retry once
+    let file;
+    try {
+      file = await ctx.api.getFile(voice.file_id);
+    } catch (err: any) {
+      console.error(`getFile failed (attempt 1): ${err.message}`);
+      // Retry once after a short delay
+      try {
+        await new Promise((r) => setTimeout(r, 3000));
+        file = await ctx.api.getFile(voice.file_id);
+      } catch (retryErr: any) {
+        console.error(`getFile failed (attempt 2): ${retryErr.message}`);
+        await ctx.reply("Не удалось скачать голосовое сообщение. Попробуй ещё раз.");
+        return;
+      }
+    }
 
     if (!file.file_path) {
       await ctx.reply("Could not download voice message.");
