@@ -109,6 +109,51 @@ export class Bridge {
     return true;
   }
 
+  private buildStatusLine(result: {
+    total_cost_usd?: number;
+    modelUsage?: Record<string, { inputTokens: number; outputTokens: number; costUSD: number }>;
+  }): string {
+    const parts: string[] = [];
+
+    // Model name: use the selected model or extract from modelUsage keys
+    const modelName = this.model
+      || (result.modelUsage ? Object.keys(result.modelUsage)[0] : undefined);
+    if (modelName) {
+      const short = modelName
+        .replace(/^claude-/, "")
+        .replace(/-\d{8}$/, "");
+      parts.push(short);
+    }
+
+    // Effort
+    if (this.effort) {
+      parts.push(this.effort);
+    }
+
+    // Tokens from modelUsage
+    if (result.modelUsage) {
+      let totalIn = 0;
+      let totalOut = 0;
+      for (const u of Object.values(result.modelUsage)) {
+        totalIn += u.inputTokens;
+        totalOut += u.outputTokens;
+      }
+      const fmt = (n: number) => n >= 1_000_000
+        ? (n / 1_000_000).toFixed(1) + "M"
+        : n >= 1_000
+          ? (n / 1_000).toFixed(0) + "k"
+          : String(n);
+      parts.push(`${fmt(totalIn)}↓ ${fmt(totalOut)}↑`);
+    }
+
+    // Cost
+    if (result.total_cost_usd != null && result.total_cost_usd > 0) {
+      parts.push(`$${result.total_cost_usd.toFixed(2)}`);
+    }
+
+    return parts.length > 0 ? `\`${parts.join(" · ")}\`` : "";
+  }
+
   async stop(): Promise<boolean> {
     if (!this.currentQuery || !this.isProcessing) return false;
     try {
@@ -159,6 +204,7 @@ export class Bridge {
 
     const streamer = new Streamer(this.api, chatId, ackMessageId);
     this.currentStreamer = streamer;
+    let statusLine: string | undefined;
 
     try {
       let promptInput: any;
@@ -252,12 +298,13 @@ export class Bridge {
               await streamer.append(`\n\nError: ${errors.join("\n")}`);
             }
           }
+          statusLine = this.buildStatusLine(message as any);
         }
       }
     } catch (err: any) {
       await streamer.append(`\n\nBridge error: ${err.message || err}`);
     } finally {
-      await streamer.finalize();
+      await streamer.finalize(statusLine);
       this.currentQuery = null;
       this.currentStreamer = null;
       this.isProcessing = false;

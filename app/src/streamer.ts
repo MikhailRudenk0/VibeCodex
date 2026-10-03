@@ -58,13 +58,18 @@ export class Streamer {
     }
   }
 
-  async finalize(): Promise<void> {
+  async finalize(statusLine?: string): Promise<void> {
     if (this.finalized) return;
     this.finalized = true;
 
     if (this.editTimer) {
       clearTimeout(this.editTimer);
       this.editTimer = null;
+    }
+
+    // Append status line to the very end of the response
+    if (statusLine) {
+      this.text += "\n\n" + statusLine;
     }
 
     // Final text might still exceed MAX (last chunk). Split it.
