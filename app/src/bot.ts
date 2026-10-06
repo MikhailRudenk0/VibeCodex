@@ -101,7 +101,9 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   // Restore saved state (survives OOM restarts), fall back to session discovery
   const saved =
     config.provider === "codex" ? await CodexBridge.loadState() : await Bridge.loadState();
-  if (saved) {
+  if (saved && !existsSync(saved.projectPath)) {
+    console.log(`Saved project ${saved.projectPath} no longer exists; keeping ${bridge.projectPath}`);
+  } else if (saved) {
     bridge.projectPath = saved.projectPath;
     bridge.sessionId = saved.sessionId;
     if (saved.model) bridge.model = saved.model;

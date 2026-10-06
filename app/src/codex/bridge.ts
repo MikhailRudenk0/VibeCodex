@@ -6,7 +6,9 @@ import { Streamer } from "../streamer.js";
 import type { ProjectInfo } from "../projects.js";
 import { AppServer, type AppServerNotification } from "./app-server.js";
 
-const STATE_DIR = join(homedir(), ".local", "state", "vibeide");
+// VIBEIDE_STATE_DIR lets tests keep their own state instead of clobbering the
+// running bot's current project and thread.
+const STATE_DIR = process.env.VIBEIDE_STATE_DIR || join(homedir(), ".local", "state", "vibeide");
 const STATE_FILE = join(STATE_DIR, "state-codex.json");
 
 /** Effort levels Codex accepts; the picker in bot.ts renders this order. */
@@ -82,6 +84,11 @@ export class CodexBridge {
       (notification) => this.handleNotification(notification),
       (message) => console.error(message)
     );
+  }
+
+  /** Shuts down the app-server subprocess. The bot keeps it alive; tests do not. */
+  close(): void {
+    this.server.close();
   }
 
   // ---------------------------------------------------------------- state

@@ -8,7 +8,11 @@
 import { mkdtemp, writeFile, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
-import { CodexBridge } from "../app/src/codex/bridge.js";
+// Must be set before the bridge module reads it at import time.
+process.env.VIBEIDE_STATE_DIR =
+  process.env.VIBEIDE_STATE_DIR || join(tmpdir(), "vibeide-smoke-state");
+
+const { CodexBridge } = await import("../app/src/codex/bridge.js");
 
 interface Call { kind: "send" | "edit"; messageId: number; text: string; at: number }
 
@@ -97,7 +101,9 @@ async function main() {
   await slow;
   await new Promise((r) => setTimeout(r, 1500));
 
+  bridge.close();
   await rm(workdir, { recursive: true, force: true });
+  await rm(process.env.VIBEIDE_STATE_DIR!, { recursive: true, force: true });
   console.log(`\n${failures === 0 ? "ВСЕ ПРОВЕРКИ ПРОШЛИ" : `ПРОВАЛЕНО: ${failures}`}`);
   process.exit(failures === 0 ? 0 : 1);
 }
