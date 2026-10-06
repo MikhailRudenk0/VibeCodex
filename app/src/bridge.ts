@@ -75,6 +75,11 @@ export class Bridge {
       .catch(() => {});
   }
 
+  /** Claude's effort levels are fixed, unlike Codex's per-model list. */
+  async getSupportedEfforts(): Promise<string[]> {
+    return ["low", "medium", "high", "xhigh", "max"];
+  }
+
   async getSupportedModels(): Promise<ModelInfo[]> {
     if (this.cachedModels.length > 0) return this.cachedModels;
     if (!this.currentQuery) return [];

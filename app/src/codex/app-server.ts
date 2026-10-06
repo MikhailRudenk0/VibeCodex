@@ -77,17 +77,7 @@ export class AppServer {
       throw new AppServerError("app-server is not running");
     }
 
-    const id = this.nextId++;
-    const response = new Promise<any>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new AppServerError(`app-server request timed out: ${method}`));
-      }, timeoutMs ?? this.timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-    });
-
-    this.write({ id, method, params });
-    return response;
+    return this.dispatch(method, params, timeoutMs ?? this.timeoutMs);
   }
 
   notify(method: string, params?: Record<string, any>): void {
@@ -139,24 +129,42 @@ export class AppServer {
     });
 
     // The handshake itself cannot go through request(): start() has not resolved yet.
-    const initialize = this.rawRequest("initialize", {
-      clientInfo: { name: "vibeide", version: "0.2.0" },
-      capabilities: { experimentalApi: true },
-    });
-    await initialize;
+    await this.dispatch(
+      "initialize",
+      {
+        clientInfo: { name: "vibeide", version: "0.2.0" },
+        capabilities: { experimentalApi: true },
+      },
+      this.timeoutMs
+    );
     this.notify("initialized");
   }
 
-  private rawRequest(method: string, params: Record<string, any>): Promise<any> {
+  /**
+   * Sends one request and waits for its response. The pending entry is removed
+   * again if the write itself fails, so a failed send cannot leave a promise
+   * that rejects later with nobody listening.
+   */
+  private dispatch(method: string, params: Record<string, any>, timeoutMs: number): Promise<any> {
     const id = this.nextId++;
+    let settle!: { resolve: (value: any) => void; reject: (error: Error) => void };
     const response = new Promise<any>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new AppServerError(`app-server request timed out: ${method}`));
-      }, this.timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      settle = { resolve, reject };
     });
-    this.write({ id, method, params });
+
+    const timer = setTimeout(() => {
+      this.pending.delete(id);
+      settle.reject(new AppServerError(`app-server request timed out: ${method}`));
+    }, timeoutMs);
+    this.pending.set(id, { ...settle, timer });
+
+    try {
+      this.write({ id, method, params });
+    } catch (err) {
+      clearTimeout(timer);
+      this.pending.delete(id);
+      throw err;
+    }
     return response;
   }
 

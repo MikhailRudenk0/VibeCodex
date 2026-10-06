@@ -8,9 +8,11 @@
 import { mkdtemp, writeFile, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
-// Must be set before the bridge module reads it at import time.
-process.env.VIBEIDE_STATE_DIR =
-  process.env.VIBEIDE_STATE_DIR || join(tmpdir(), "vibeide-smoke-state");
+// Must be set before the bridge module reads it at import time. The test always
+// uses its own directory: honouring an inherited one would mean deleting a
+// directory the developer chose, possibly the live state.
+const stateDir = await mkdtemp(join(tmpdir(), "vibeide-smoke-state-"));
+process.env.VIBEIDE_STATE_DIR = stateDir;
 
 const { CodexBridge } = await import("../app/src/codex/bridge.js");
 
@@ -90,8 +92,29 @@ async function main() {
   check("проекты получены", projects.length > 0, `${projects.length} шт.`);
   check("текущий каталог в списке", projects.some((p) => p.path === workdir));
 
-  // ---- 5. queueing while busy -----------------------------------------
-  console.log("\n5. очередь при занятости");
+  // ---- 5. switching projects mid-session -------------------------------
+  // Regression: tracking only the app-server generation made ensureThread skip
+  // the open step after /switch, and every later turn failed with "thread not found".
+  console.log("\n5. переключение проекта");
+  const other = await mkdtemp(join(tmpdir(), "vibeide-smoke2-"));
+  await writeFile(join(other, "other.txt"), "second marker 9182\n");
+  bridge.projectPath = other;
+  await bridge.resumeLatestSession();
+  calls.length = 0;
+  await bridge.sendMessage(1, "Прочитай other.txt в текущем каталоге и напиши ТОЛЬКО число из него.");
+  const afterSwitch = calls.filter((c) => c.kind === "edit").at(-1)?.text ?? calls.at(-1)?.text ?? "";
+  check("после /switch ход проходит", afterSwitch.includes("9182"), afterSwitch.replace(/\n/g, " ").slice(0, 120));
+  check("нет ошибки thread not found", !/thread not found/i.test(afterSwitch));
+  await rm(other, { recursive: true, force: true });
+
+  // ---- 6. effort levels come from the backend --------------------------
+  console.log("\n6. уровни усилий");
+  const efforts = await bridge.getSupportedEfforts();
+  check("уровни получены", efforts.length > 0, efforts.join(", "));
+  check("нет несуществующего minimal", !efforts.includes("minimal"));
+
+  // ---- 7. queueing while busy -----------------------------------------
+  console.log("\n7. очередь при занятости");
   calls.length = 0;
   const slow = bridge.sendMessage(1, "Посчитай от 1 до 20 словами, по одному слову в строке.");
   await new Promise((r) => setTimeout(r, 600));
@@ -103,7 +126,7 @@ async function main() {
 
   bridge.close();
   await rm(workdir, { recursive: true, force: true });
-  await rm(process.env.VIBEIDE_STATE_DIR!, { recursive: true, force: true });
+  await rm(stateDir, { recursive: true, force: true });
   console.log(`\n${failures === 0 ? "ВСЕ ПРОВЕРКИ ПРОШЛИ" : `ПРОВАЛЕНО: ${failures}`}`);
   process.exit(failures === 0 ? 0 : 1);
 }

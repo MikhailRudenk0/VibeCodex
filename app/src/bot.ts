@@ -4,7 +4,7 @@ import { createReadStream, existsSync } from "fs";
 import { writeFile, unlink, stat } from "fs/promises";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import type { Config, Provider } from "./config.js";
+import type { Config } from "./config.js";
 import { Bridge } from "./bridge.js";
 import { CodexBridge } from "./codex/bridge.js";
 import { formatRelativeTime, type ProjectInfo } from "./projects.js";
@@ -23,6 +23,8 @@ interface AgentBridge {
   clearSession(): void;
   saveState(): void;
   getSupportedModels(): Promise<{ value: string; displayName: string }[]>;
+  /** Effort levels this backend accepts right now, in the order to show them. */
+  getSupportedEfforts(): Promise<string[]>;
   setModel(model: string): Promise<boolean>;
   setEffort(effort: string): Promise<boolean>;
   stop(): Promise<boolean>;
@@ -35,25 +37,24 @@ interface AgentBridge {
 
 interface EffortChoice { value: string; label: string; desc: string }
 
-const CLAUDE_EFFORTS: EffortChoice[] = [
-  { value: "low",    label: "🟢 Low",    desc: "Fast, minimal thinking" },
-  { value: "medium", label: "🟡 Medium", desc: "Balanced" },
-  { value: "high",   label: "🟠 High",   desc: "Deep reasoning (default)" },
-  { value: "xhigh",  label: "🔴 XHigh",  desc: "Extended, for hard tasks" },
-  { value: "max",    label: "⚫ Max",    desc: "Maximum, no limits" },
-];
+/**
+ * Presentation for effort levels. Which ones are offered is decided by the
+ * backend — Codex reports them per model and they differ between models — so
+ * anything unknown still renders with its bare name rather than disappearing.
+ */
+const EFFORT_LABELS: Record<string, { label: string; desc: string }> = {
+  minimal: { label: "⚪ Minimal", desc: "Almost no reasoning" },
+  low:     { label: "🟢 Low",     desc: "Fast, lighter reasoning" },
+  medium:  { label: "🟡 Medium",  desc: "Balanced" },
+  high:    { label: "🟠 High",    desc: "Deep reasoning" },
+  xhigh:   { label: "🔴 XHigh",   desc: "Extended, for hard tasks" },
+  max:     { label: "⚫ Max",     desc: "Maximum effort" },
+  ultra:   { label: "🟣 Ultra",   desc: "Beyond max, slowest" },
+};
 
-// Codex has `minimal` instead of Claude's `max`; the rest line up by name.
-const CODEX_EFFORT_CHOICES: EffortChoice[] = [
-  { value: "minimal", label: "⚪ Minimal", desc: "Almost no reasoning" },
-  { value: "low",     label: "🟢 Low",     desc: "Fast, lighter reasoning" },
-  { value: "medium",  label: "🟡 Medium",  desc: "Balanced" },
-  { value: "high",    label: "🟠 High",    desc: "Deep reasoning" },
-  { value: "xhigh",   label: "🔴 XHigh",   desc: "Extended, for hard tasks" },
-];
-
-function effortLevelsFor(provider: Provider): EffortChoice[] {
-  return provider === "codex" ? CODEX_EFFORT_CHOICES : CLAUDE_EFFORTS;
+function describeEffort(value: string): EffortChoice {
+  const known = EFFORT_LABELS[value];
+  return { value, label: known?.label ?? value, desc: known?.desc ?? "" };
 }
 
 function transcribeAudio(audioPath: string): Promise<string> {
@@ -91,32 +92,47 @@ function transcribeAudio(audioPath: string): Promise<string> {
 
 export async function createBot(config: Config, initialProjectPath?: string): Promise<Bot> {
   const bot = new Bot(config.telegramBotToken);
-  const EFFORT_LEVELS = effortLevelsFor(config.provider);
 
   const bridge: AgentBridge =
     config.provider === "codex"
       ? new CodexBridge(bot.api, initialProjectPath, config.codex)
       : new Bridge(bot.api, initialProjectPath);
 
-  /** Backing list for the /switch keyboard; see the comment at its handler. */
-  let switchChoices: ProjectInfo[] = [];
+  /**
+   * Backing lists for /switch keyboards, keyed by the message the buttons live
+   * on. A single shared list would let one user's tap land on another user's
+   * project, or an old message's button point at the wrong index.
+   */
+  const switchChoices = new Map<number, ProjectInfo[]>();
 
   // Restore saved state (survives OOM restarts), fall back to session discovery
   const saved =
     config.provider === "codex" ? await CodexBridge.loadState() : await Bridge.loadState();
-  if (saved && !existsSync(saved.projectPath)) {
+  // Model and effort are preferences: they survive even when the saved project
+  // is gone or the session was cleared with /new.
+  if (saved?.model) bridge.model = saved.model;
+  if (saved?.effort) bridge.effort = saved.effort;
+
+  const projectUsable = saved ? existsSync(saved.projectPath) : false;
+  if (saved && !projectUsable) {
     console.log(`Saved project ${saved.projectPath} no longer exists; keeping ${bridge.projectPath}`);
   } else if (saved) {
     bridge.projectPath = saved.projectPath;
     bridge.sessionId = saved.sessionId;
-    if (saved.model) bridge.model = saved.model;
-    if (saved.effort) bridge.effort = saved.effort;
-    console.log(`Restored state: project=${saved.projectPath}, session=${saved.sessionId.slice(0, 8)}..., model=${saved.model || 'default'}, effort=${saved.effort || 'default'}`);
+  }
+
+  if (saved?.sessionId && projectUsable) {
+    console.log(
+      `Restored state: project=${saved.projectPath}, session=${saved.sessionId.slice(0, 8)}..., ` +
+      `model=${saved.model || "default"}, effort=${saved.effort || "default"}`
+    );
   } else {
     const resumedId = await bridge.resumeLatestSession();
-    if (resumedId) {
-      console.log(`Resuming session: ${resumedId.slice(0, 8)}...`);
-    }
+    console.log(
+      resumedId
+        ? `Resuming session: ${resumedId.slice(0, 8)}... in ${bridge.projectPath}`
+        : `Starting fresh in ${bridge.projectPath}`
+    );
   }
 
   // Global error handler — prevents crashes from unhandled errors
@@ -205,10 +221,16 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
   // /effort command — show effort level picker
   bot.command("effort", async (ctx) => {
+    const efforts = await bridge.getSupportedEfforts();
+    if (efforts.length === 0) {
+      await ctx.reply("Уровни усилий недоступны. Отправь любое сообщение, затем попробуй снова.");
+      return;
+    }
+
     const keyboard = new InlineKeyboard();
-    for (const e of EFFORT_LEVELS) {
-      const current = bridge.effort === e.value ? " ✓" : "";
-      keyboard.text(`${e.label}${current}`, `effort:${e.value}`).row();
+    for (const value of efforts) {
+      const current = bridge.effort === value ? " ✓" : "";
+      keyboard.text(`${describeEffort(value).label}${current}`, `effort:${value}`).row();
     }
 
     await ctx.reply("Уровень усилий:", { reply_markup: keyboard });
@@ -219,9 +241,10 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     const effortValue = ctx.callbackQuery.data.slice("effort:".length);
     const ok = await bridge.setEffort(effortValue);
     await ctx.answerCallbackQuery();
-    const info = EFFORT_LEVELS.find((e) => e.value === effortValue);
-    if (ok && info) {
-      await ctx.editMessageText(`Effort: ${info.label} — ${info.desc}`, { parse_mode: "Markdown" });
+    const info = describeEffort(effortValue);
+    if (ok) {
+      const suffix = info.desc ? ` — ${info.desc}` : "";
+      await ctx.editMessageText(`Effort: ${info.label}${suffix}`, { parse_mode: "Markdown" });
     } else {
       await ctx.editMessageText(`Не удалось установить effort: \`${effortValue}\``, { parse_mode: "Markdown" });
     }
@@ -305,20 +328,27 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
     // Telegram rejects callback_data over 64 bytes and project paths routinely
     // exceed that, so the buttons carry an index into the list they were built from.
-    switchChoices = projects.slice(0, 20);
+    const choices = projects.slice(0, 20);
     const keyboard = new InlineKeyboard();
-    switchChoices.forEach((project, index) => {
+    choices.forEach((project, index) => {
       keyboard
         .text(`${project.name} (${formatRelativeTime(project.lastActivity)})`, `switch:${index}`)
         .row();
     });
 
-    await ctx.reply("Pick a project:", { reply_markup: keyboard });
+    const sent = await ctx.reply("Pick a project:", { reply_markup: keyboard });
+    switchChoices.set(sent.message_id, choices);
+    // Keep the map from growing without bound across a long-running process.
+    if (switchChoices.size > 50) {
+      switchChoices.delete(switchChoices.keys().next().value!);
+    }
   });
 
   // Handle inline keyboard callbacks for project switching
   bot.callbackQuery(/^switch:/, async (ctx) => {
-    const choice = switchChoices[Number(ctx.callbackQuery.data.slice("switch:".length))];
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const choices = messageId === undefined ? undefined : switchChoices.get(messageId);
+    const choice = choices?.[Number(ctx.callbackQuery.data.slice("switch:".length))];
     if (!choice) {
       await ctx.answerCallbackQuery();
       await ctx.editMessageText("Этот список устарел — вызови /switch заново.");

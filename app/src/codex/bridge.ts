@@ -12,9 +12,11 @@ import { AppServer, type AppServerNotification } from "./app-server.js";
 const STATE_DIR = process.env.VIBEIDE_STATE_DIR || join(homedir(), ".local", "state", "vibeide");
 const STATE_FILE = join(STATE_DIR, "state-codex.json");
 
-/** Effort levels Codex accepts; the picker in bot.ts renders this order. */
-export const CODEX_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"] as const;
-export type CodexEffort = (typeof CODEX_EFFORTS)[number];
+/**
+ * Effort levels differ per model (gpt-6-luna has no `ultra`, and no model has
+ * `minimal`), so the real list comes from model/list rather than a constant here.
+ */
+export type CodexEffort = string;
 
 export interface ModelChoice {
   value: string;
@@ -35,12 +37,14 @@ interface QueuedMessage {
 }
 
 interface SavedState {
-  sessionId: string;
+  /** Absent after /new — the project and preferences still have to survive. */
+  sessionId?: string;
   projectPath: string;
   model?: string;
   effort?: CodexEffort;
 }
 
+// turn/start takes a structured policy; thread/start takes the plain mode string.
 const SANDBOX_POLICY = {
   "read-only": { type: "readOnly" as const },
   "workspace-write": { type: "workspaceWrite" as const },
@@ -59,6 +63,7 @@ export class CodexBridge {
   private readonly options: Required<CodexBridgeOptions>;
 
   private cachedModels: ModelChoice[] = [];
+  private modelEfforts = new Map<string, string[]>();
   private isProcessing = false;
   private pendingMessage: QueuedMessage | null = null;
 
@@ -68,8 +73,14 @@ export class CodexBridge {
   /** Text already pushed to Telegram per item, so a late item/completed adds only the tail. */
   private streamedByItem = new Map<string, string>();
   private lastUsage: { input: number; output: number } | null = null;
-  /** app-server generation the current thread belongs to; -1 means "not live". */
-  private threadGeneration = -1;
+  /** Which thread is actually open, and in which app-server instance. */
+  private openThread: { id: string; generation: number } | null = null;
+  /**
+   * Streamer.append is not reentrant — it awaits Telegram calls while mutating
+   * its own buffer — so every append from the notification handler is chained
+   * onto the previous one instead of being fired and forgotten.
+   */
+  private appendChain: Promise<void> = Promise.resolve();
   /** Everything streamed during this turn, used to avoid echoing a message twice. */
   private streamedThisTurn = "";
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -99,7 +110,7 @@ export class CodexBridge {
         onDisconnect: (error) => {
           // A dead subprocess cannot deliver turn/completed, so release the turn
           // instead of leaving the bot stuck on isProcessing forever.
-          this.threadGeneration = -1;
+          this.openThread = null;
           if (this.finishTurn) {
             this.turnError = error.message;
             this.finishTurn();
@@ -119,7 +130,7 @@ export class CodexBridge {
   static async loadState(): Promise<SavedState | null> {
     try {
       const data = JSON.parse(await readFile(STATE_FILE, "utf-8"));
-      if (data.sessionId && data.projectPath) return data;
+      if (data.projectPath) return data;
     } catch {}
     return null;
   }
@@ -196,8 +207,15 @@ export class CodexBridge {
     if (this.cachedModels.length > 0) return this.cachedModels;
     try {
       const result = await this.server.request("model/list", {});
-      this.cachedModels = (result?.data ?? [])
-        .filter((model: any) => !model.hidden)
+      const available = (result?.data ?? []).filter((model: any) => !model.hidden);
+      for (const model of available) {
+        const id = model.id ?? model.model;
+        const efforts = (model.supportedReasoningEfforts ?? [])
+          .map((entry: any) => entry.reasoningEffort)
+          .filter(Boolean);
+        if (id && efforts.length) this.modelEfforts.set(id, efforts);
+      }
+      this.cachedModels = available
         .map((model: any) => ({
           value: model.id ?? model.model,
           displayName: model.displayName ?? model.id ?? model.model,
@@ -207,6 +225,18 @@ export class CodexBridge {
     } catch {
       return [];
     }
+  }
+
+  /** Effort levels the model in use actually accepts. */
+  async getSupportedEfforts(): Promise<string[]> {
+    await this.getSupportedModels();
+    const current = this.model ?? this.effectiveModel;
+    const forCurrent = current ? this.modelEfforts.get(current) : undefined;
+    if (forCurrent?.length) return forCurrent;
+    // Unknown model: offer only what every known model supports.
+    const lists = [...this.modelEfforts.values()];
+    if (lists.length === 0) return [];
+    return lists.reduce((common, list) => common.filter((e) => list.includes(e)));
   }
 
   /**
@@ -228,6 +258,15 @@ export class CodexBridge {
 
   // ------------------------------------------------------------ execution
 
+  /** Queues text behind everything already queued for this turn. */
+  private queueAppend(text: string): void {
+    const streamer = this.currentStreamer;
+    if (!streamer || !text) return;
+    this.appendChain = this.appendChain
+      .then(() => streamer.append(text))
+      .catch((err) => console.error("Streamer append failed:", err));
+  }
+
   async stop(): Promise<boolean> {
     if (!this.isProcessing || !this.sessionId || !this.currentTurnId) return false;
     try {
@@ -238,9 +277,7 @@ export class CodexBridge {
     } catch {
       // Already finished — fall through and close the message anyway.
     }
-    if (this.currentStreamer) {
-      await this.currentStreamer.append("\n\n⛔ Остановлено");
-    }
+    this.queueAppend("\n\n⛔ Остановлено");
     this.finishTurn?.();
     return true;
   }
@@ -268,6 +305,7 @@ export class CodexBridge {
     this.streamedByItem.clear();
     this.streamedThisTurn = "";
     this.finishedTurnIds.clear();
+    this.appendChain = Promise.resolve();
 
     let ackMessageId: number | undefined;
     try {
@@ -318,13 +356,15 @@ export class CodexBridge {
       this.armIdleWatchdog();
       await turnEnded;
 
-      if (this.turnError) await streamer.append(`\n\nError: ${this.turnError}`);
+      if (this.turnError) this.queueAppend(`\n\nError: ${this.turnError}`);
       statusLine = this.buildStatusLine();
     } catch (err: any) {
-      await streamer.append(`\n\nBridge error: ${err?.message || err}`);
+      this.queueAppend(`\n\nBridge error: ${err?.message || err}`);
     } finally {
       this.clearIdleWatchdog();
       this.finishTurn = null;
+      // Drain queued appends before closing the message, or the tail is lost.
+      await this.appendChain.catch(() => {});
       await streamer.finalize(statusLine);
       this.currentStreamer = null;
       this.currentTurnId = undefined;
@@ -347,8 +387,15 @@ export class CodexBridge {
     await this.server.start();
 
     // A thread already open in this app-server needs nothing: resuming it again
-    // trips the "thread already has an active writer" conflict.
-    if (this.sessionId && this.threadGeneration === this.server.generation) return;
+    // trips the "thread already has an active writer" conflict. The id must match
+    // too — /switch swaps sessionId for a thread this process has never opened.
+    if (
+      this.sessionId &&
+      this.openThread?.id === this.sessionId &&
+      this.openThread.generation === this.server.generation
+    ) {
+      return;
+    }
 
     if (this.sessionId) {
       try {
@@ -356,7 +403,7 @@ export class CodexBridge {
           threadId: this.sessionId,
           cwd: this.projectPath,
         });
-        this.threadGeneration = this.server.generation;
+        this.openThread = { id: this.sessionId, generation: this.server.generation };
         return;
       } catch (err) {
         console.error(`Could not resume thread ${this.sessionId}, starting a new one:`, err);
@@ -367,14 +414,14 @@ export class CodexBridge {
     const result = await this.server.request("thread/start", {
       cwd: this.projectPath,
       approvalPolicy: this.options.approvalPolicy,
-      sandboxPolicy: SANDBOX_POLICY[this.options.sandboxMode],
+      sandbox: this.options.sandboxMode,
       ...(this.model ? { model: this.model } : {}),
     });
     this.sessionId = result?.thread?.id;
     if (!this.sessionId) throw new Error("app-server did not return a thread id");
     this.effectiveModel = result?.thread?.model ?? this.effectiveModel;
     this.effectiveEffort = result?.thread?.reasoningEffort ?? this.effectiveEffort;
-    this.threadGeneration = this.server.generation;
+    this.openThread = { id: this.sessionId, generation: this.server.generation };
     this.saveState();
   }
 
@@ -396,7 +443,7 @@ export class CodexBridge {
         const itemId: string = params.itemId ?? "";
         this.streamedByItem.set(itemId, (this.streamedByItem.get(itemId) ?? "") + params.delta);
         this.streamedThisTurn += params.delta;
-        void streamer.append(params.delta);
+        this.queueAppend(params.delta);
         return;
       }
 
@@ -404,7 +451,7 @@ export class CodexBridge {
         if (!streamer || !this.options.toolNotices) return;
         const item = params.item ?? {};
         if (item.type === "commandExecution" && item.command) {
-          void streamer.append(`\n\n🔧 ${String(item.command).slice(0, 120)}\n`);
+          this.queueAppend(`\n\n🔧 ${String(item.command).slice(0, 120)}\n`);
         }
         return;
       }
@@ -419,10 +466,10 @@ export class CodexBridge {
         if (!full) return;
         if (full.startsWith(streamed)) {
           const tail = full.slice(streamed.length);
-          if (tail) void streamer.append(tail);
+          if (tail) this.queueAppend(tail);
         } else if (!this.streamedThisTurn.includes(full)) {
           // Deltas and the final item disagree, and this text is genuinely new.
-          void streamer.append(full);
+          this.queueAppend(full);
           this.streamedThisTurn += full;
         }
         this.streamedByItem.set(item.id ?? "", full);
@@ -448,15 +495,17 @@ export class CodexBridge {
       }
 
       case "error": {
-        this.turnError = params.message ?? "unknown error";
-        this.finishTurn?.();
+        this.turnError = params.error?.message ?? "unknown error";
+        // willRetry means Codex handles it internally and keeps streaming;
+        // finishing here would finalize the message and lose the retried output.
+        if (!params.willRetry) this.finishTurn?.();
         return;
       }
 
-      case "turn/failed":
       case "turn/completed": {
-        if (method === "turn/failed") {
-          this.turnError = params.error?.message ?? "turn failed";
+        const status: string | undefined = params.turn?.status;
+        if (status === "failed") {
+          this.turnError = params.turn?.error?.message ?? "turn failed";
         }
         const turnId: string | undefined = params.turn?.id ?? params.turnId;
         if (!turnId) {
