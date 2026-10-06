@@ -22,6 +22,29 @@ app/src/codex/bridge.ts      — CodexBridge, та же поверхность, 
 test/codex-smoke.ts          — e2e-тест против живого app-server
 ```
 
+### Установка Codex: ставить целиком, не один бинарник
+
+Архив `codex-*.tar.gz` из GitHub Releases содержит ТОЛЬКО `codex`. Без
+`codex-code-mode-host`, который лежит рядом с ним в npm-пакете, агент
+отвечает «инструмент доступа к файлам недоступен» — выполнение команд и
+правка файлов не работают вовсе, а в логе видно
+`failed to spawn code-mode host`. Ставить так:
+
+```bash
+npm pack @openai/codex@<версия>-linux-x64     # или -darwin-arm64 и т.п.
+tar xzf openai-codex-*.tgz
+cp -a package/vendor/<target>/. /usr/local/lib/codex/
+ln -s /usr/local/lib/codex/bin/codex /usr/local/bin/codex
+codex doctor                                   # runtime/search должны быть ✓
+```
+
+Дерево `vendor` несёт ещё `codex-path/rg` для поиска и `codex-resources`
+(voice, zsh, bwrap). Установка через `npm i -g @openai/codex` даёт всё сразу.
+
+На Ubuntu 24.04 AppArmor блокирует непривилегированные user namespaces
+(`kernel.apparmor_restrict_unprivileged_userns=1`), поэтому песочница bwrap
+там не поднимается — работать можно только с `CODEX_SANDBOX_MODE=danger-full-access`.
+
 Проекты для `/projects` и `/switch` берутся из `thread/list`, сгруппированных по
 `cwd`, — список известных каталогов, а не обход файловой системы.
 Стоимости в статус-строке нет: по подписке Codex её не возвращает.
