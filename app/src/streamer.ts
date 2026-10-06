@@ -15,6 +15,13 @@ export class Streamer {
   private editTimer: ReturnType<typeof setTimeout> | null = null;
   private finalized = false;
   private sentMessages: number[] = [];
+  /**
+   * Telegram applies concurrent edits of one message in completion order, not
+   * call order. A throttled edit still in flight when the turn ends would land
+   * after the final one and leave the user looking at older text with the
+   * progress suffix still on it, so every write goes through this queue.
+   */
+  private inFlight: Promise<void> = Promise.resolve();
 
   constructor(api: Api<RawApi>, chatId: number, initialMessageId?: number) {
     this.api = api;
@@ -22,6 +29,13 @@ export class Streamer {
     // If an acknowledgment message was already sent, reuse it: the first
     // streamed chunk edits that message in place instead of sending a new one.
     this.messageId = initialMessageId ?? null;
+  }
+
+  /** Runs one Telegram write after everything already queued. */
+  private enqueue(task: () => Promise<void>): Promise<void> {
+    const next = this.inFlight.then(task);
+    this.inFlight = next.catch(() => {});
+    return next;
   }
 
   async append(delta: string): Promise<void> {
@@ -40,19 +54,19 @@ export class Streamer {
 
       if (this.messageId) {
         // Finalize current message with the chunk (plain-text fallback safe)
-        await this.finalizeCurrentMessage();
+        await this.enqueue(() => this.finalizeCurrentMessage());
         this.sentMessages.push(this.messageId);
         this.messageId = null;
       } else {
         // No message yet — send the chunk as a completed plain-text message
-        await this.sendPlainChunk(chunk);
+        await this.enqueue(() => this.sendPlainChunk(chunk));
       }
 
       this.text = rest;
     }
 
     if (!this.messageId && this.text) {
-      await this.sendInitial();
+      await this.enqueue(() => this.sendInitial());
     } else if (this.messageId) {
       this.scheduleEdit();
     }
@@ -66,6 +80,9 @@ export class Streamer {
       clearTimeout(this.editTimer);
       this.editTimer = null;
     }
+
+    // A throttled edit may already be on the wire; its text is older than ours.
+    await this.inFlight;
 
     // Append status line to the very end of the response
     if (statusLine) {
@@ -81,11 +98,11 @@ export class Streamer {
       this.text = chunk;
 
       if (this.messageId) {
-        await this.finalizeCurrentMessage();
+        await this.enqueue(() => this.finalizeCurrentMessage());
         this.sentMessages.push(this.messageId);
         this.messageId = null;
       } else {
-        await this.sendWithMarkdown(chunk);
+        await this.enqueue(() => this.sendWithMarkdown(chunk));
       }
 
       this.text = rest;
@@ -93,9 +110,9 @@ export class Streamer {
 
     // Send/finalize the last chunk
     if (!this.messageId && this.text) {
-      await this.sendWithMarkdown(this.text);
+      await this.enqueue(() => this.sendWithMarkdown(this.text));
     } else if (this.messageId) {
-      await this.finalizeCurrentMessage();
+      await this.enqueue(() => this.finalizeCurrentMessage());
     }
   }
 
@@ -150,9 +167,9 @@ export class Streamer {
     const elapsed = Date.now() - this.lastEditTime;
     const delay = Math.max(0, EDIT_INTERVAL_MS - elapsed);
 
-    this.editTimer = setTimeout(async () => {
+    this.editTimer = setTimeout(() => {
       this.editTimer = null;
-      await this.flushEdit();
+      void this.enqueue(() => this.flushEdit());
     }, delay);
   }
 
