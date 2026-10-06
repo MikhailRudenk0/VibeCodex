@@ -1,19 +1,41 @@
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 import { exec } from "child_process";
-import { createReadStream } from "fs";
+import { createReadStream, existsSync } from "fs";
 import { writeFile, unlink, stat } from "fs/promises";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import type { Config } from "./config.js";
+import type { Config, Provider } from "./config.js";
 import { Bridge } from "./bridge.js";
-import type { EffortLevel } from "./bridge.js";
-import {
-  listProjects,
-  formatRelativeTime,
-  type ProjectInfo,
-} from "./projects.js";
+import { CodexBridge } from "./codex/bridge.js";
+import { formatRelativeTime, type ProjectInfo } from "./projects.js";
 
-const EFFORT_LEVELS: { value: EffortLevel; label: string; desc: string }[] = [
+/**
+ * What the Telegram layer needs from an agent backend. Both bridges satisfy it,
+ * so every handler below is provider-agnostic.
+ */
+interface AgentBridge {
+  projectPath: string;
+  sessionId: string | undefined;
+  model: string | undefined;
+  effort: string | undefined;
+  listProjects(): Promise<ProjectInfo[]>;
+  resumeLatestSession(): Promise<string | undefined>;
+  clearSession(): void;
+  saveState(): void;
+  getSupportedModels(): Promise<{ value: string; displayName: string }[]>;
+  setModel(model: string): Promise<boolean>;
+  setEffort(effort: string): Promise<boolean>;
+  stop(): Promise<boolean>;
+  sendMessage(
+    chatId: number,
+    text: string,
+    images?: { data: string; mediaType: string }[]
+  ): Promise<void>;
+}
+
+interface EffortChoice { value: string; label: string; desc: string }
+
+const CLAUDE_EFFORTS: EffortChoice[] = [
   { value: "low",    label: "🟢 Low",    desc: "Fast, minimal thinking" },
   { value: "medium", label: "🟡 Medium", desc: "Balanced" },
   { value: "high",   label: "🟠 High",   desc: "Deep reasoning (default)" },
@@ -21,10 +43,31 @@ const EFFORT_LEVELS: { value: EffortLevel; label: string; desc: string }[] = [
   { value: "max",    label: "⚫ Max",    desc: "Maximum, no limits" },
 ];
 
+// Codex has `minimal` instead of Claude's `max`; the rest line up by name.
+const CODEX_EFFORT_CHOICES: EffortChoice[] = [
+  { value: "minimal", label: "⚪ Minimal", desc: "Almost no reasoning" },
+  { value: "low",     label: "🟢 Low",     desc: "Fast, lighter reasoning" },
+  { value: "medium",  label: "🟡 Medium",  desc: "Balanced" },
+  { value: "high",    label: "🟠 High",    desc: "Deep reasoning" },
+  { value: "xhigh",   label: "🔴 XHigh",   desc: "Extended, for hard tasks" },
+];
+
+function effortLevelsFor(provider: Provider): EffortChoice[] {
+  return provider === "codex" ? CODEX_EFFORT_CHOICES : CLAUDE_EFFORTS;
+}
+
 function transcribeAudio(audioPath: string): Promise<string> {
   // Resolve transcribe.sh relative to the project root (two levels up from app/src/)
   const projectRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
   const script = join(projectRoot, "bin", "transcribe.sh");
+
+  if (!existsSync(script)) {
+    // bin/ is gitignored and carries platform-specific whisper builds, so a fresh
+    // checkout has no transcriber. Say that plainly instead of leaking a shell error.
+    return Promise.reject(
+      new Error("распознавание голоса не установлено (нет bin/transcribe.sh)")
+    );
+  }
 
   return new Promise((resolve, reject) => {
     exec(
@@ -48,10 +91,16 @@ function transcribeAudio(audioPath: string): Promise<string> {
 
 export async function createBot(config: Config, initialProjectPath?: string): Promise<Bot> {
   const bot = new Bot(config.telegramBotToken);
-  const bridge = new Bridge(bot.api, initialProjectPath);
+  const EFFORT_LEVELS = effortLevelsFor(config.provider);
+
+  const bridge: AgentBridge =
+    config.provider === "codex"
+      ? new CodexBridge(bot.api, initialProjectPath, config.codex)
+      : new Bridge(bot.api, initialProjectPath);
 
   // Restore saved state (survives OOM restarts), fall back to session discovery
-  const saved = await Bridge.loadState();
+  const saved =
+    config.provider === "codex" ? await CodexBridge.loadState() : await Bridge.loadState();
   if (saved) {
     bridge.projectPath = saved.projectPath;
     bridge.sessionId = saved.sessionId;
@@ -82,7 +131,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   // /start command
   bot.command("start", async (ctx) => {
     await ctx.reply(
-      `VibeIDE connected.\nProject: \`${bridge.projectPath}\`\n\nCommands:\n/projects — list projects\n/switch — change project\n/new — fresh session\n/stop — interrupt current task\n/status — current state\n/file <path> — send a file`,
+      `VibeIDE connected (${config.provider}).\nProject: \`${bridge.projectPath}\`\n\nCommands:\n/projects — list projects\n/switch — change project\n/new — fresh session\n/stop — interrupt current task\n/status — current state\n/file <path> — send a file`,
       { parse_mode: "Markdown" }
     );
   });
@@ -93,9 +142,9 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       ? `\`${bridge.sessionId.slice(0, 8)}...\``
       : "none (will start on next message)";
     const modelInfo = bridge.model || "default";
-    const effortInfo = bridge.effort || "default (high)";
+    const effortInfo = bridge.effort || "default";
     await ctx.reply(
-      `Project: \`${bridge.projectPath}\`\nSession: ${sessionInfo}\nModel: \`${modelInfo}\`\nEffort: \`${effortInfo}\``,
+      `Provider: \`${config.provider}\`\nProject: \`${bridge.projectPath}\`\nSession: ${sessionInfo}\nModel: \`${modelInfo}\`\nEffort: \`${effortInfo}\``,
       { parse_mode: "Markdown" }
     );
   });
@@ -162,7 +211,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
   // Handle effort selection callback
   bot.callbackQuery(/^effort:/, async (ctx) => {
-    const effortValue = ctx.callbackQuery.data.slice("effort:".length) as EffortLevel;
+    const effortValue = ctx.callbackQuery.data.slice("effort:".length);
     const ok = await bridge.setEffort(effortValue);
     await ctx.answerCallbackQuery();
     const info = EFFORT_LEVELS.find((e) => e.value === effortValue);
@@ -229,9 +278,9 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
   // /projects command — list available projects
   bot.command("projects", async (ctx) => {
-    const projects = await listProjects();
+    const projects = await bridge.listProjects();
     if (projects.length === 0) {
-      await ctx.reply("No projects found in ~/.claude/projects/");
+      await ctx.reply("Проектов пока нет — они появятся после первой задачи в каталоге.");
       return;
     }
 
@@ -243,9 +292,9 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
   // /switch command — show project picker
   bot.command("switch", async (ctx) => {
-    const projects = await listProjects();
+    const projects = await bridge.listProjects();
     if (projects.length === 0) {
-      await ctx.reply("No projects found in ~/.claude/projects/");
+      await ctx.reply("Проектов пока нет — они появятся после первой задачи в каталоге.");
       return;
     }
 

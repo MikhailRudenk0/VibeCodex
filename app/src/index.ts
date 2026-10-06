@@ -15,7 +15,7 @@ const shutdown = () => {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-console.log(`VibeIDE running.`);
+console.log(`VibeIDE running (provider: ${config.provider}).`);
 if (projectPath) {
   console.log(`Project: ${projectPath}`);
 }

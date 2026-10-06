@@ -4,9 +4,25 @@ import dotenv from "dotenv";
 // This allows running multiple bot instances with different .env files.
 dotenv.config({ path: process.env.ENV_FILE || ".env", override: true });
 
+export type Provider = "codex" | "claude";
+
 export interface Config {
   telegramBotToken: string;
   allowedUserIds: number[];
+  provider: Provider;
+  codex: {
+    sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
+    approvalPolicy: "never" | "on-request" | "on-failure" | "untrusted";
+    toolNotices: boolean;
+  };
+}
+
+function parseProvider(raw: string | undefined): Provider {
+  const value = (raw || "codex").trim().toLowerCase();
+  if (value !== "codex" && value !== "claude") {
+    throw new Error(`AGENT_PROVIDER must be "codex" or "claude", got: ${raw}`);
+  }
+  return value;
 }
 
 export function loadConfig(): Config {
@@ -30,5 +46,18 @@ export function loadConfig(): Config {
     throw new Error("TELEGRAM_ALLOWED_USER_ID must contain at least one user ID");
   }
 
-  return { telegramBotToken: token, allowedUserIds };
+  const sandboxMode = (process.env.CODEX_SANDBOX_MODE || "danger-full-access") as Config["codex"]["sandboxMode"];
+  const approvalPolicy = (process.env.CODEX_APPROVAL_POLICY || "never") as Config["codex"]["approvalPolicy"];
+
+  return {
+    telegramBotToken: token,
+    allowedUserIds,
+    provider: parseProvider(process.env.AGENT_PROVIDER),
+    codex: {
+      sandboxMode,
+      approvalPolicy,
+      // Off by default: one streamed message per request, same as before.
+      toolNotices: process.env.CODEX_TOOL_NOTICES === "true",
+    },
+  };
 }

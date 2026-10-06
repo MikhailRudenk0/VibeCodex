@@ -5,7 +5,7 @@ import { writeFile, readFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
 import { Streamer } from "./streamer.js";
-import { findLatestSessionId } from "./projects.js";
+import { findLatestSessionId, listProjects, type ProjectInfo } from "./projects.js";
 
 const STATE_DIR = join(homedir(), ".local", "state", "vibeide");
 const STATE_FILE = join(STATE_DIR, "state.json");
@@ -33,6 +33,11 @@ export class Bridge {
   constructor(api: Api<RawApi>, projectPath?: string) {
     this.api = api;
     this.projectPath = projectPath || process.cwd();
+  }
+
+  /** Claude Code keeps one folder per project under ~/.claude/projects. */
+  async listProjects(): Promise<ProjectInfo[]> {
+    return listProjects();
   }
 
   async resumeLatestSession(): Promise<string | undefined> {
