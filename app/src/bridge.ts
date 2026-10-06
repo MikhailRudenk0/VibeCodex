@@ -3,12 +3,10 @@ import type { ModelInfo, EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { Api, RawApi } from "grammy";
 import { writeFile, readFile, mkdir } from "fs/promises";
 import { join } from "path";
-import { homedir } from "os";
 import { Streamer } from "./streamer.js";
 import { findLatestSessionId, listProjects, type ProjectInfo } from "./projects.js";
+import { stateDir, stateFile } from "./state.js";
 
-const STATE_DIR = join(homedir(), ".local", "state", "vibeide");
-const STATE_FILE = join(STATE_DIR, "state.json");
 
 interface QueuedMessage {
   chatId: number;
@@ -57,7 +55,7 @@ export class Bridge {
     effort?: EffortLevel;
   } | null> {
     try {
-      const data = JSON.parse(await readFile(STATE_FILE, "utf-8"));
+      const data = JSON.parse(await readFile(stateFile("state"), "utf-8"));
       if (data.sessionId && data.projectPath) return data;
     } catch {}
     return null;
@@ -70,8 +68,8 @@ export class Bridge {
       model: this.model,
       effort: this.effort,
     });
-    mkdir(STATE_DIR, { recursive: true })
-      .then(() => writeFile(STATE_FILE, data))
+    mkdir(stateDir(), { recursive: true })
+      .then(() => writeFile(stateFile("state"), data))
       .catch(() => {});
   }
 

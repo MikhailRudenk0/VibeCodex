@@ -2,15 +2,12 @@ import type { Api, RawApi } from "grammy";
 import { writeFile, readFile, mkdir, unlink } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
-import { homedir, tmpdir } from "os";
+import { tmpdir } from "os";
 import { Streamer } from "../streamer.js";
 import type { ProjectInfo } from "../projects.js";
 import { AppServer, type AppServerNotification } from "./app-server.js";
+import { stateDir, stateFile } from "../state.js";
 
-// VIBEIDE_STATE_DIR lets tests keep their own state instead of clobbering the
-// running bot's current project and thread.
-const STATE_DIR = process.env.VIBEIDE_STATE_DIR || join(homedir(), ".local", "state", "vibeide");
-const STATE_FILE = join(STATE_DIR, "state-codex.json");
 
 /**
  * Effort levels differ per model (gpt-6-luna has no `ultra`, and no model has
@@ -129,7 +126,7 @@ export class CodexBridge {
 
   static async loadState(): Promise<SavedState | null> {
     try {
-      const data = JSON.parse(await readFile(STATE_FILE, "utf-8"));
+      const data = JSON.parse(await readFile(stateFile("state-codex"), "utf-8"));
       if (data.projectPath) return data;
     } catch {}
     return null;
@@ -142,8 +139,8 @@ export class CodexBridge {
       model: this.model,
       effort: this.effort,
     });
-    mkdir(STATE_DIR, { recursive: true })
-      .then(() => writeFile(STATE_FILE, data))
+    mkdir(stateDir(), { recursive: true })
+      .then(() => writeFile(stateFile("state-codex"), data))
       .catch(() => {});
   }
 
