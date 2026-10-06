@@ -1,5 +1,6 @@
 import type { Api, RawApi } from "grammy";
 import { writeFile, readFile, mkdir, unlink } from "fs/promises";
+import { existsSync } from "fs";
 import { join } from "path";
 import { homedir, tmpdir } from "os";
 import { Streamer } from "../streamer.js";
@@ -67,10 +68,21 @@ export class CodexBridge {
   /** Text already pushed to Telegram per item, so a late item/completed adds only the tail. */
   private streamedByItem = new Map<string, string>();
   private lastUsage: { input: number; output: number } | null = null;
+  /** app-server generation the current thread belongs to; -1 means "not live". */
+  private threadGeneration = -1;
+  /** Everything streamed during this turn, used to avoid echoing a message twice. */
+  private streamedThisTurn = "";
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
   /** Model/effort actually in force, reported by the server — may differ from the override. */
   private effectiveModel: string | undefined;
   private effectiveEffort: string | undefined;
   private turnError: string | null = null;
+  /**
+   * Turn ids already reported complete. A turn's completion can land before
+   * turn/start returns its id, and a previous turn's completion can land after
+   * the next turn is armed — matching on id handles both.
+   */
+  private finishedTurnIds = new Set<string>();
 
   constructor(api: Api<RawApi>, projectPath?: string, options: CodexBridgeOptions = {}) {
     this.api = api;
@@ -82,7 +94,18 @@ export class CodexBridge {
     };
     this.server = new AppServer(
       (notification) => this.handleNotification(notification),
-      (message) => console.error(message)
+      (message) => console.error(message),
+      {
+        onDisconnect: (error) => {
+          // A dead subprocess cannot deliver turn/completed, so release the turn
+          // instead of leaving the bot stuck on isProcessing forever.
+          this.threadGeneration = -1;
+          if (this.finishTurn) {
+            this.turnError = error.message;
+            this.finishTurn();
+          }
+        },
+      }
     );
   }
 
@@ -136,7 +159,8 @@ export class CodexBridge {
     const byPath = new Map<string, ProjectInfo>();
     for (const thread of threads) {
       const path = thread?.cwd;
-      if (!path) continue;
+      // Threads outlive their directories; a deleted path is not a project.
+      if (!path || !existsSync(path)) continue;
       const activity = new Date((thread.updatedAt ?? thread.createdAt ?? 0) * 1000);
       const existing = byPath.get(path);
       if (existing && existing.lastActivity >= activity) continue;
@@ -242,6 +266,8 @@ export class CodexBridge {
     this.lastUsage = null;
     this.turnError = null;
     this.streamedByItem.clear();
+    this.streamedThisTurn = "";
+    this.finishedTurnIds.clear();
 
     let ackMessageId: number | undefined;
     try {
@@ -285,7 +311,11 @@ export class CodexBridge {
         sandboxPolicy: SANDBOX_POLICY[this.options.sandboxMode],
       });
       this.currentTurnId = turn?.turn?.id;
+      if (this.currentTurnId && this.finishedTurnIds.has(this.currentTurnId)) {
+        this.finishTurn?.();
+      }
 
+      this.armIdleWatchdog();
       await turnEnded;
 
       if (this.turnError) await streamer.append(`\n\nError: ${this.turnError}`);
@@ -293,6 +323,7 @@ export class CodexBridge {
     } catch (err: any) {
       await streamer.append(`\n\nBridge error: ${err?.message || err}`);
     } finally {
+      this.clearIdleWatchdog();
       this.finishTurn = null;
       await streamer.finalize(statusLine);
       this.currentStreamer = null;
@@ -313,12 +344,19 @@ export class CodexBridge {
   // ------------------------------------------------------------- internals
 
   private async ensureThread(): Promise<void> {
+    await this.server.start();
+
+    // A thread already open in this app-server needs nothing: resuming it again
+    // trips the "thread already has an active writer" conflict.
+    if (this.sessionId && this.threadGeneration === this.server.generation) return;
+
     if (this.sessionId) {
       try {
         await this.server.request("thread/resume", {
           threadId: this.sessionId,
           cwd: this.projectPath,
         });
+        this.threadGeneration = this.server.generation;
         return;
       } catch (err) {
         console.error(`Could not resume thread ${this.sessionId}, starting a new one:`, err);
@@ -336,6 +374,7 @@ export class CodexBridge {
     if (!this.sessionId) throw new Error("app-server did not return a thread id");
     this.effectiveModel = result?.thread?.model ?? this.effectiveModel;
     this.effectiveEffort = result?.thread?.reasoningEffort ?? this.effectiveEffort;
+    this.threadGeneration = this.server.generation;
     this.saveState();
   }
 
@@ -348,6 +387,7 @@ export class CodexBridge {
 
   private handleNotification({ method, params }: AppServerNotification): void {
     if (params.threadId && this.sessionId && params.threadId !== this.sessionId) return;
+    if (this.idleTimer) this.armIdleWatchdog();
     const streamer = this.currentStreamer;
 
     switch (method) {
@@ -355,6 +395,7 @@ export class CodexBridge {
         if (!streamer || !params.delta) return;
         const itemId: string = params.itemId ?? "";
         this.streamedByItem.set(itemId, (this.streamedByItem.get(itemId) ?? "") + params.delta);
+        this.streamedThisTurn += params.delta;
         void streamer.append(params.delta);
         return;
       }
@@ -375,11 +416,14 @@ export class CodexBridge {
         // a model that skips streaming still produces a complete answer.
         const streamed = this.streamedByItem.get(item.id ?? "") ?? "";
         const full: string = item.text ?? "";
+        if (!full) return;
         if (full.startsWith(streamed)) {
           const tail = full.slice(streamed.length);
           if (tail) void streamer.append(tail);
-        } else if (full) {
+        } else if (!this.streamedThisTurn.includes(full)) {
+          // Deltas and the final item disagree, and this text is genuinely new.
           void streamer.append(full);
+          this.streamedThisTurn += full;
         }
         this.streamedByItem.set(item.id ?? "", full);
         return;
@@ -409,23 +453,39 @@ export class CodexBridge {
         return;
       }
 
-      case "turn/failed": {
-        this.turnError = params.error?.message ?? "turn failed";
-        this.finishTurn?.();
-        return;
-      }
-
+      case "turn/failed":
       case "turn/completed": {
-        this.finishTurn?.();
-        return;
-      }
-
-      case "thread/status/changed": {
-        // Safety net: if a turn ends without turn/completed, idle still releases us.
-        if (params.status?.type === "idle") this.finishTurn?.();
+        if (method === "turn/failed") {
+          this.turnError = params.error?.message ?? "turn failed";
+        }
+        const turnId: string | undefined = params.turn?.id ?? params.turnId;
+        if (!turnId) {
+          this.finishTurn?.();
+          return;
+        }
+        this.finishedTurnIds.add(turnId);
+        if (turnId === this.currentTurnId) this.finishTurn?.();
         return;
       }
     }
+  }
+
+  /**
+   * Releases a turn that has gone completely silent. Long tasks keep emitting
+   * notifications, so prolonged silence means something was lost, not slow.
+   */
+  private armIdleWatchdog(): void {
+    this.clearIdleWatchdog();
+    this.idleTimer = setTimeout(() => {
+      if (!this.finishTurn) return;
+      this.turnError = "Codex молчит 15 минут — ход прерван";
+      this.finishTurn();
+    }, 15 * 60_000);
+  }
+
+  private clearIdleWatchdog(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = null;
   }
 
   private buildStatusLine(): string {

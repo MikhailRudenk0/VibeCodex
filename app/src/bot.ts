@@ -98,6 +98,9 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       ? new CodexBridge(bot.api, initialProjectPath, config.codex)
       : new Bridge(bot.api, initialProjectPath);
 
+  /** Backing list for the /switch keyboard; see the comment at its handler. */
+  let switchChoices: ProjectInfo[] = [];
+
   // Restore saved state (survives OOM restarts), fall back to session discovery
   const saved =
     config.provider === "codex" ? await CodexBridge.loadState() : await Bridge.loadState();
@@ -300,22 +303,28 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       return;
     }
 
+    // Telegram rejects callback_data over 64 bytes and project paths routinely
+    // exceed that, so the buttons carry an index into the list they were built from.
+    switchChoices = projects.slice(0, 20);
     const keyboard = new InlineKeyboard();
-    for (const project of projects.slice(0, 20)) {
+    switchChoices.forEach((project, index) => {
       keyboard
-        .text(
-          `${project.name} (${formatRelativeTime(project.lastActivity)})`,
-          `switch:${project.path}`
-        )
+        .text(`${project.name} (${formatRelativeTime(project.lastActivity)})`, `switch:${index}`)
         .row();
-    }
+    });
 
     await ctx.reply("Pick a project:", { reply_markup: keyboard });
   });
 
   // Handle inline keyboard callbacks for project switching
   bot.callbackQuery(/^switch:/, async (ctx) => {
-    const projectPath = ctx.callbackQuery.data.slice("switch:".length);
+    const choice = switchChoices[Number(ctx.callbackQuery.data.slice("switch:".length))];
+    if (!choice) {
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText("Этот список устарел — вызови /switch заново.");
+      return;
+    }
+    const projectPath = choice.path;
     bridge.projectPath = projectPath;
     const resumedId = await bridge.resumeLatestSession();
     bridge.saveState();

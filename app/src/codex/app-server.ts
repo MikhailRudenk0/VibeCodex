@@ -19,6 +19,12 @@ export interface AppServerOptions {
   command?: string;
   env?: NodeJS.ProcessEnv;
   requestTimeoutMs?: number;
+  /**
+   * Called when the subprocess goes away. In-flight requests reject on their own,
+   * but anything waiting on notifications (a running turn) would hang forever
+   * without this.
+   */
+  onDisconnect?: (error: Error) => void;
 }
 
 /**
@@ -36,6 +42,7 @@ export class AppServer {
   private pending = new Map<number, PendingRequest>();
   private nextId = 1;
   private starting: Promise<void> | null = null;
+  private spawnCount = 0;
   private readonly timeoutMs: number;
 
   constructor(
@@ -44,6 +51,11 @@ export class AppServer {
     private readonly options: AppServerOptions = {}
   ) {
     this.timeoutMs = options.requestTimeoutMs ?? 60_000;
+  }
+
+  /** Increments on every spawn, so callers can tell a restarted server from the old one. */
+  get generation(): number {
+    return this.spawnCount;
   }
 
   /** Spawns and initializes the server if needed. Concurrent callers share one attempt. */
@@ -92,6 +104,7 @@ export class AppServer {
 
   private async spawnAndInitialize(): Promise<void> {
     const command = this.options.command ?? "codex";
+    this.spawnCount++;
     const proc = spawn(command, ["app-server"], {
       stdio: ["pipe", "pipe", "pipe"],
       env: this.options.env ?? process.env,
@@ -199,6 +212,7 @@ export class AppServer {
   }
 
   private teardown(error: Error): void {
+    const wasRunning = this.proc !== null;
     for (const [id, entry] of this.pending) {
       this.pending.delete(id);
       clearTimeout(entry.timer);
@@ -208,5 +222,6 @@ export class AppServer {
     this.reader = null;
     this.proc = null;
     this.starting = null;
+    if (wasRunning) this.options.onDisconnect?.(error);
   }
 }

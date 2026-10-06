@@ -81,7 +81,7 @@ async function main() {
   calls.length = 0;
   await bridge.sendMessage(1, "Прочитай файл hello.txt в текущем каталоге и напиши ТОЛЬКО число, которое в нём есть.");
   const second = (calls.filter((c) => c.kind === "edit").at(-1)?.text ?? calls.at(-1)?.text ?? "");
-  check("команда выполнена, число найдено", second.includes("4711"), second.split("\n")[0].slice(0, 80));
+  check("команда выполнена, число найдено", second.includes("4711"), second.replace(/\n/g, " ").slice(0, 200));
   check("сессия та же", bridge.sessionId === firstSession, bridge.sessionId);
 
   // ---- 4. projects -----------------------------------------------------

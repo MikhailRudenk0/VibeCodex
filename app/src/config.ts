@@ -17,6 +17,19 @@ export interface Config {
   };
 }
 
+function parseOneOf<T extends string>(
+  name: string,
+  raw: string | undefined,
+  allowed: readonly T[],
+  fallback: T
+): T {
+  const value = (raw || fallback).trim().toLowerCase();
+  if (!(allowed as readonly string[]).includes(value)) {
+    throw new Error(`${name} must be one of ${allowed.join(", ")}; got: ${raw}`);
+  }
+  return value as T;
+}
+
 function parseProvider(raw: string | undefined): Provider {
   const value = (raw || "codex").trim().toLowerCase();
   if (value !== "codex" && value !== "claude") {
@@ -46,8 +59,20 @@ export function loadConfig(): Config {
     throw new Error("TELEGRAM_ALLOWED_USER_ID must contain at least one user ID");
   }
 
-  const sandboxMode = (process.env.CODEX_SANDBOX_MODE || "danger-full-access") as Config["codex"]["sandboxMode"];
-  const approvalPolicy = (process.env.CODEX_APPROVAL_POLICY || "never") as Config["codex"]["approvalPolicy"];
+  // Validate rather than cast: a typo here would silently send an unknown policy
+  // to the agent instead of the sandbox the operator asked for.
+  const sandboxMode = parseOneOf(
+    "CODEX_SANDBOX_MODE",
+    process.env.CODEX_SANDBOX_MODE,
+    ["read-only", "workspace-write", "danger-full-access"] as const,
+    "danger-full-access"
+  );
+  const approvalPolicy = parseOneOf(
+    "CODEX_APPROVAL_POLICY",
+    process.env.CODEX_APPROVAL_POLICY,
+    ["never", "on-request", "on-failure", "untrusted"] as const,
+    "never"
+  );
 
   return {
     telegramBotToken: token,
