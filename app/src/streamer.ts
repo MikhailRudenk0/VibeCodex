@@ -1,6 +1,11 @@
 import type { Api, RawApi } from "grammy";
 
-const EDIT_INTERVAL_MS = 300;
+// Telegram throttles a bot to roughly one write per second per chat. Codex emits
+// hundreds of deltas per answer, so a 300 ms cadence sat far above that limit and
+// earned 429s with retry_after up to 19 s.
+const EDIT_INTERVAL_MS = Number(process.env.STREAM_EDIT_INTERVAL_MS) || 900;
+/** Upper bound for the adaptive backoff applied after a rate limit. */
+const MAX_EDIT_INTERVAL_MS = 8000;
 const MAX_MESSAGE_LENGTH = 3800; // Leave room for formatting overhead under 4096 limit
 // Streaming edits are sent as PLAIN text (Markdown can be mid-token/invalid),
 // so keep this free of Markdown markup — otherwise underscores/asterisks show literally.
@@ -22,6 +27,10 @@ export class Streamer {
    * progress suffix still on it, so every write goes through this queue.
    */
   private inFlight: Promise<void> = Promise.resolve();
+  /** Grows when Telegram pushes back, so one 429 does not become a storm. */
+  private editInterval = EDIT_INTERVAL_MS;
+  /** Nothing may be sent before this moment; set from Telegram's retry_after. */
+  private nextCallAt = 0;
 
   constructor(api: Api<RawApi>, chatId: number, initialMessageId?: number) {
     this.api = api;
@@ -29,6 +38,35 @@ export class Streamer {
     // If an acknowledgment message was already sent, reuse it: the first
     // streamed chunk edits that message in place instead of sending a new one.
     this.messageId = initialMessageId ?? null;
+  }
+
+  /**
+   * Performs one Telegram call, waiting out any rate limit Telegram asked for.
+   * Previously a failed send left messageId unset, so the next delta retried
+   * immediately — one 429 turned into hundreds and the reply never appeared.
+   */
+  private async call<T>(label: string, fn: () => Promise<T>): Promise<T | null> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const wait = this.nextCallAt - Date.now();
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+
+      try {
+        return await fn();
+      } catch (err: any) {
+        const retryAfter = err?.parameters?.retry_after;
+        if (typeof retryAfter === "number") {
+          this.nextCallAt = Date.now() + (retryAfter + 1) * 1000;
+          this.editInterval = Math.min(this.editInterval * 2, MAX_EDIT_INTERVAL_MS);
+          continue;
+        }
+        // Editing a message to its current text is a no-op, not a failure.
+        if (/message is not modified/i.test(String(err?.description ?? err))) return null;
+        console.error(`${label}: ${err?.description ?? err}`);
+        return null;
+      }
+    }
+    console.error(`${label}: Telegram kept rate limiting; giving up`);
+    return null;
   }
 
   /** Runs one Telegram write after everything already queued. */
@@ -138,26 +176,21 @@ export class Streamer {
 
   /** Send a completed plain-text chunk (no progress suffix, no Markdown) */
   private async sendPlainChunk(text: string): Promise<void> {
-    try {
-      const msg = await this.api.sendMessage(this.chatId, text);
-      this.sentMessages.push(msg.message_id);
-    } catch (e) {
-      console.error("Failed to send plain chunk:", e);
-    }
+    const msg = await this.call("Failed to send plain chunk", () =>
+      this.api.sendMessage(this.chatId, text)
+    );
+    if (msg) this.sentMessages.push(msg.message_id);
   }
 
   /** Send initial message as plain text with progress indicator */
   private async sendInitial(): Promise<void> {
     const content = this.text || "...";
-    try {
-      const msg = await this.api.sendMessage(
-        this.chatId,
-        content + PROGRESS_SUFFIX
-      );
+    const msg = await this.call("Failed to send message", () =>
+      this.api.sendMessage(this.chatId, content + PROGRESS_SUFFIX)
+    );
+    if (msg) {
       this.messageId = msg.message_id;
       this.lastEditTime = Date.now();
-    } catch (e) {
-      console.error("Failed to send message:", e);
     }
   }
 
@@ -165,7 +198,7 @@ export class Streamer {
     if (this.editTimer) return;
 
     const elapsed = Date.now() - this.lastEditTime;
-    const delay = Math.max(0, EDIT_INTERVAL_MS - elapsed);
+    const delay = Math.max(0, this.editInterval - elapsed);
 
     this.editTimer = setTimeout(() => {
       this.editTimer = null;
@@ -176,61 +209,49 @@ export class Streamer {
   /** Edit message with plain text + progress indicator (during streaming) */
   private async flushEdit(): Promise<void> {
     if (!this.messageId || !this.text) return;
-
-    try {
-      await this.api.editMessageText(
-        this.chatId,
-        this.messageId,
-        this.text + PROGRESS_SUFFIX
-      );
-      this.lastEditTime = Date.now();
-    } catch {
-      // Message unchanged or other error — ignore
-    }
+    // Intermediate frames are disposable: if one is lost the next carries the
+    // same text plus more. Only the closing edit has to land.
+    const messageId = this.messageId;
+    const text = this.text;
+    await this.call("Progress edit", () =>
+      this.api.editMessageText(this.chatId, messageId, text + PROGRESS_SUFFIX)
+    );
+    this.lastEditTime = Date.now();
   }
 
   /** Final edit: apply Markdown formatting, remove progress indicator */
   private async finalizeCurrentMessage(): Promise<void> {
     if (!this.messageId || !this.text) return;
+    const messageId = this.messageId;
+    const text = this.text;
 
     try {
-      await this.api.editMessageText(
-        this.chatId,
-        this.messageId,
-        this.text,
-        { parse_mode: "Markdown" }
+      await this.call("Final edit", () =>
+        this.api.editMessageText(this.chatId, messageId, text, { parse_mode: "Markdown" })
       );
+    } finally {
       this.lastEditTime = Date.now();
-    } catch {
-      // Markdown failed — try plain text without progress indicator
-      try {
-        await this.api.editMessageText(
-          this.chatId,
-          this.messageId,
-          this.text
-        );
-        this.lastEditTime = Date.now();
-      } catch {
-        // Message unchanged — ignore
-      }
     }
+
+    // Markdown may be rejected mid-token; the plain-text pass is what guarantees
+    // the progress suffix is gone, so it runs whenever the first one did not land.
+    await this.call("Final edit (plain)", () =>
+      this.api.editMessageText(this.chatId, messageId, text)
+    );
   }
 
   /** Send a new message directly with Markdown (used in finalize when no messageId yet) */
   private async sendWithMarkdown(content: string): Promise<void> {
-    try {
-      const msg = await this.api.sendMessage(this.chatId, content, {
-        parse_mode: "Markdown",
-      });
-      this.messageId = msg.message_id;
-    } catch {
-      // Markdown failed — send plain text
-      try {
-        const msg = await this.api.sendMessage(this.chatId, content);
-        this.messageId = msg.message_id;
-      } catch (e) {
-        console.error("Failed to send message:", e);
-      }
+    const formatted = await this.call("Markdown send", () =>
+      this.api.sendMessage(this.chatId, content, { parse_mode: "Markdown" })
+    );
+    if (formatted) {
+      this.messageId = formatted.message_id;
+      return;
     }
+    const plain = await this.call("Failed to send message", () =>
+      this.api.sendMessage(this.chatId, content)
+    );
+    if (plain) this.messageId = plain.message_id;
   }
 }
