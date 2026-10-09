@@ -19,7 +19,15 @@ try {
   process.exit(2);
 }
 
-const bot = await createBot(config);
+let bot;
+try {
+  bot = await createBot(config);
+} catch (err: any) {
+  // Чужой токен, отозванный бот, неверные настройки — всё это перезапуском не
+  // лечится, поэтому код 2: обёртка на нём останавливается, а не крутит цикл.
+  console.error(err?.message || err);
+  process.exit(2);
+}
 
 // Graceful shutdown
 const shutdown = () => {
