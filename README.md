@@ -51,17 +51,32 @@ Open Telegram, message [@BotFather](https://t.me/BotFather), send `/newbot`, pic
 **3. Configure**
 
 ```bash
-cp .env.example .env
+cp vibecodex.example.yaml vibecodex.yaml
 ```
 
-Edit `.env`:
+Edit `vibecodex.yaml`:
 
-```
-TELEGRAM_BOT_TOKEN=7123456789:AAH...   # from BotFather
-TELEGRAM_ALLOWED_USER_ID=123456789     # your Telegram user ID (message @userinfobot to get it)
+```yaml
+instances:
+  main:
+    bot:
+      token: "7123456789:AAH..."      # from BotFather
+      username: YourBotName           # checked against getMe on startup
+      allowedUserIds: [123456789]     # message @userinfobot to get yours
+    projectPath: /home/you/projects   # absolute path
+    provider: codex                   # codex | claude
 ```
 
-If you're on Claude Pro/Max, that's it — the SDK uses your existing `claude login` session. If you're on API billing, also add `ANTHROPIC_API_KEY` to `.env`.
+One instance name selects its token *and* its working directory together, so a
+bot cannot be started with one instance's token pointing at another's files. The
+`username` field is verified against Telegram at startup: a token belonging to a
+different bot stops the instance from starting at all.
+
+Add more blocks under `instances:` to run several bots from one checkout.
+
+With Codex you need `codex login` done once on the machine. With Claude on
+Pro/Max the SDK reuses your existing `claude login` session; on API billing set
+`ANTHROPIC_API_KEY` in the environment.
 
 **4. Run**
 
@@ -219,19 +234,31 @@ vibeide/
 │   └── projects.ts     # Project discovery from ~/.claude/projects/
 ├── package.json
 ├── tsconfig.json
-├── .env.example
+├── vibecodex.example.yaml
 └── .gitignore
 ```
 
 ## Configuration
 
-| Variable                   | Where     | Required | Description                                                                 |
-| -------------------------- | --------- | -------- | --------------------------------------------------------------------------- |
-| `TELEGRAM_BOT_TOKEN`       | `.env`    | Yes | Bot token from [@BotFather](https://t.me/BotFather)                         |
-| `TELEGRAM_ALLOWED_USER_ID` | `.env`    | Yes | Your numeric Telegram ID (message [@userinfobot](https://t.me/userinfobot)) |
-| `ANTHROPIC_API_KEY`        | `.env`    | No  | Only needed for API billing. If you're on Claude Pro/Max, the SDK uses your existing `claude login` session automatically. |
+Everything lives in `vibecodex.yaml`, one block per instance:
 
-The project path is passed as a CLI argument. If omitted, VibeIDE uses the current working directory.
+| Key | Required | Description |
+| --- | -------- | ----------- |
+| `bot.token` | Yes | Token from [@BotFather](https://t.me/BotFather) |
+| `bot.username` | No | Verified against `getMe` at startup; a mismatch refuses to start |
+| `bot.allowedUserIds` | Yes | Numeric Telegram IDs (message [@userinfobot](https://t.me/userinfobot)) |
+| `projectPath` | Yes | Absolute path the agent starts in |
+| `provider` | No | `codex` (default) or `claude` |
+| `codex.sandboxMode` | No | `read-only`, `workspace-write`, `danger-full-access` (default) |
+| `codex.approvalPolicy` | No | `never` (default), `on-request`, `on-failure`, `untrusted` |
+| `codex.toolNotices` | No | `true` folds a one-line `🔧 command` notice into the same reply |
+
+Run an instance by name: `./run-bot.sh main`. Settings are validated before the
+bot touches Telegram — an unknown instance lists the ones that exist, and a
+malformed token, a relative path or a missing directory each fail with the file,
+instance and field named.
+
+`VIBECODEX_CONFIG` overrides the config location.
 
 ## Security
 
