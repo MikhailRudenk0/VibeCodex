@@ -2,6 +2,11 @@ node_modules/
 dist/
 .env
 .env.*
+
+# Настройки с токенами
+vibecodex.yaml
+vibecodex.yml
+vibecodex.json
 .claude/
 *.tsbuildinfo
 

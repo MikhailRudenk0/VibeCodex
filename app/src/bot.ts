@@ -8,6 +8,7 @@ import type { Config } from "./config.js";
 import { Bridge } from "./bridge.js";
 import { CodexBridge } from "./codex/bridge.js";
 import { formatRelativeTime, type ProjectInfo } from "./projects.js";
+import { setInstanceId } from "./state.js";
 
 /**
  * What the Telegram layer needs from an agent backend. Both bridges satisfy it,
@@ -90,13 +91,28 @@ function transcribeAudio(audioPath: string): Promise<string> {
   });
 }
 
-export async function createBot(config: Config, initialProjectPath?: string): Promise<Bot> {
+export async function createBot(config: Config): Promise<Bot> {
+  // До всего остального: состояние этого инстанса не должно смешаться с чужим.
+  setInstanceId(config.instance);
+
   const bot = new Bot(config.telegramBotToken);
+
+  // Токен и рабочий каталог берутся из одного блока настроек, но сам токен мог
+  // быть вписан не тот. Спрашиваем у Telegram, кто мы, и сверяем с ожиданием —
+  // лучше не стартовать вовсе, чем отвечать из чужого бота.
+  const me = await bot.api.getMe();
+  if (config.expectedUsername && me.username?.toLowerCase() !== config.expectedUsername.toLowerCase()) {
+    throw new Error(
+      `Инстанс "${config.instance}" ожидал бота @${config.expectedUsername}, ` +
+      `а токен принадлежит @${me.username}. Проверьте bot.token в настройках.`
+    );
+  }
+  console.log(`Instance "${config.instance}" → @${me.username}, project ${config.projectPath}`);
 
   const bridge: AgentBridge =
     config.provider === "codex"
-      ? new CodexBridge(bot.api, initialProjectPath, config.codex)
-      : new Bridge(bot.api, initialProjectPath);
+      ? new CodexBridge(bot.api, config.projectPath, config.codex)
+      : new Bridge(bot.api, config.projectPath);
 
   /**
    * Backing lists for /switch keyboards, keyed by the message the buttons live
@@ -152,7 +168,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   // /start command
   bot.command("start", async (ctx) => {
     await ctx.reply(
-      `VibeIDE connected (${config.provider}).\nProject: \`${bridge.projectPath}\`\n\nCommands:\n/projects — list projects\n/switch — change project\n/new — fresh session\n/stop — interrupt current task\n/status — current state\n/file <path> — send a file`,
+      `VibeCodex «${config.instance}» (${config.provider}).\nProject: \`${bridge.projectPath}\`\n\nCommands:\n/projects — list projects\n/switch — change project\n/new — fresh session\n/stop — interrupt current task\n/status — current state\n/file <path> — send a file`,
       { parse_mode: "Markdown" }
     );
   });

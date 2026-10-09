@@ -1,10 +1,25 @@
-import { loadConfig } from "./config.js";
+import { loadConfig, listInstances } from "./config.js";
 import { createBot } from "./bot.js";
 
-const config = loadConfig();
-const projectPath = process.argv[2] || undefined;
+const instance = process.argv[2];
+if (!instance) {
+  const known = listInstances();
+  console.error(
+    "Usage: index.ts <имя-инстанса>" +
+    (known.length ? `\nДоступны: ${known.join(", ")}` : "")
+  );
+  process.exit(2);
+}
 
-const bot = await createBot(config, projectPath);
+let config;
+try {
+  config = loadConfig(instance);
+} catch (err: any) {
+  console.error(err?.message || err);
+  process.exit(2);
+}
+
+const bot = await createBot(config);
 
 // Graceful shutdown
 const shutdown = () => {
@@ -15,10 +30,7 @@ const shutdown = () => {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-console.log(`VibeIDE running (provider: ${config.provider}).`);
-if (projectPath) {
-  console.log(`Project: ${projectPath}`);
-}
-console.log("Send a message on Telegram to start.");
+console.log(`VibeCodex instance "${config.instance}" running (provider: ${config.provider}).`);
+console.log(`Project: ${config.projectPath}`);
 
 bot.start();

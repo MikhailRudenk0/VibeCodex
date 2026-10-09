@@ -1,0 +1,31 @@
+# Настройки VibeCodex. Скопируйте в vibecodex.yaml и впишите свои значения.
+#
+# Имя инстанса — первый аргумент запуска: `tsx app/src/index.ts management`.
+# Оно выбирает И токен, И рабочий каталог разом: разойтись они не могут.
+# Поле bot.username сверяется с ответом Telegram при старте — если токен принадлежит
+# другому боту, инстанс откажется запускаться, а не начнёт отвечать не оттуда.
+
+instances:
+  management:
+    bot:
+      token: "123456789:ЗАМЕНИТЕ-НА-СВОЙ-ТОКЕН"
+      username: ИмяБотаБезСобачки
+      allowedUserIds: [11111111, 22222222]
+    projectPath: /home/myuser/pignity/management
+    provider: codex          # codex | claude
+    codex:
+      sandboxMode: danger-full-access   # read-only | workspace-write | danger-full-access
+      approvalPolicy: never             # never | on-request | on-failure | untrusted
+      toolNotices: false                # true добавит строку «🔧 команда» в тот же ответ
+
+  projects:
+    bot:
+      token: "987654321:ЗАМЕНИТЕ-НА-СВОЙ-ТОКЕН"
+      username: ДругойБот
+      allowedUserIds: [11111111, 22222222]
+    projectPath: /home/myuser/pignity/projects
+    provider: codex
+    codex:
+      sandboxMode: danger-full-access
+      approvalPolicy: never
+      toolNotices: false
