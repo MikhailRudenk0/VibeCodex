@@ -171,7 +171,7 @@ Start a fresh conversation anytime with `/new`.
 - **Seamless handoff** — auto-resumes your latest Claude Code session, pick up on Telegram where you left off in VS Code
 - **Project switching** — jump between any project in `~/.claude/projects/` without restarting
 - **Image support** — send photos, screenshots, diagrams for Claude to analyze
-- **Voice messages** — transcribes voice via whisper.cpp and forwards to Claude
+- **Voice messages** — local faster-whisper recognition with a duration-based processing deadline; forwards text to the selected agent. See [setup and diagnosis](docs/VOICE_RECOGNITION.md).
 - **Long response splitting** — auto-splits at ~3800 chars, well under Telegram's 4096 limit
 - **Markdown rendering** — code blocks, bold, inline code, with plain-text fallback
 - **Single user auth** — only your Telegram account can talk to the bot

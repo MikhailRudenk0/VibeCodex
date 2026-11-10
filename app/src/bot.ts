@@ -1,14 +1,13 @@
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
-import { exec } from "child_process";
 import { createReadStream, existsSync } from "fs";
 import { writeFile, unlink, stat } from "fs/promises";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
+import { join } from "path";
 import type { Config } from "./config.js";
 import { Bridge } from "./bridge.js";
 import { CodexBridge } from "./codex/bridge.js";
 import { formatRelativeTime, type ProjectInfo } from "./projects.js";
 import { setInstanceId } from "./state.js";
+import { transcribeAudio } from "./transcription.js";
 
 /**
  * What the Telegram layer needs from an agent backend. Both bridges satisfy it,
@@ -56,39 +55,6 @@ const EFFORT_LABELS: Record<string, { label: string; desc: string }> = {
 function describeEffort(value: string): EffortChoice {
   const known = EFFORT_LABELS[value];
   return { value, label: known?.label ?? value, desc: known?.desc ?? "" };
-}
-
-function transcribeAudio(audioPath: string): Promise<string> {
-  // Resolve transcribe.sh relative to the project root (two levels up from app/src/)
-  const projectRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-  const script = join(projectRoot, "bin", "transcribe.sh");
-
-  if (!existsSync(script)) {
-    // bin/ is gitignored and carries platform-specific whisper builds, so a fresh
-    // checkout has no transcriber. Say that plainly instead of leaking a shell error.
-    return Promise.reject(
-      new Error("распознавание голоса не установлено (нет bin/transcribe.sh)")
-    );
-  }
-
-  return new Promise((resolve, reject) => {
-    exec(
-      `"${script}" "${audioPath}"`,
-      { timeout: 120_000 },
-      (err, stdout, stderr) => {
-        if (err) {
-          reject(new Error(`Transcription failed: ${stderr || err.message}`));
-        } else {
-          const text = stdout.trim();
-          if (!text) {
-            reject(new Error("Transcription returned empty result"));
-          } else {
-            resolve(text);
-          }
-        }
-      }
-    );
-  });
 }
 
 export async function createBot(config: Config): Promise<Bot> {
@@ -422,7 +388,7 @@ export async function createBot(config: Config): Promise<Bot> {
     });
   });
 
-  // Handle voice messages — transcribe via whisper.cpp, then forward text to Claude
+  // Decode voice locally, then forward the recognized text to the selected agent.
   bot.on("message:voice", async (ctx) => {
     const voice = ctx.message.voice;
 
@@ -457,12 +423,14 @@ export async function createBot(config: Config): Promise<Bot> {
     try {
       await writeFile(tmpPath, buffer);
 
-      // Transcribe via whisper.cpp (ffmpeg converts oga→wav internally)
-      const text = await transcribeAudio(tmpPath);
-      console.log(`Voice transcribed (${voice.duration}s): ${text.slice(0, 80)}...`);
+      // Local transcription; PyAV decodes OGG/Opus directly
+      const text = await transcribeAudio(tmpPath, { durationSeconds: voice.duration });
+      console.log(`Voice transcribed (${voice.duration}s, ${text.length} characters)`);
 
       // Show the user what was recognized so they can verify
-      await ctx.reply(`🎤 _${text}_`, { parse_mode: "Markdown" });
+      for (let offset = 0; offset < text.length; offset += 3800) {
+        await ctx.reply(`🎤 ${text.slice(offset, offset + 3800)}`);
+      }
 
       bridge.sendMessage(ctx.chat.id, text).catch((err) => {
         console.error("sendMessage error:", err);
