@@ -2,6 +2,7 @@ import { readFileSync, existsSync } from "fs";
 import { join, dirname, resolve, isAbsolute } from "path";
 import { fileURLToPath } from "url";
 import { parse as parseYaml } from "yaml";
+import { ProjectScope } from "./project-scope.js";
 
 export type Provider = "codex" | "claude";
 
@@ -13,11 +14,13 @@ export interface Config {
   expectedUsername?: string;
   allowedUserIds: number[];
   projectPath: string;
+  allowedProjectRoot?: string;
   provider: Provider;
   codex: {
     sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
     approvalPolicy: "never" | "on-request" | "on-failure" | "untrusted";
     toolNotices: boolean;
+    fileDeliveryMcp?: boolean;
   };
 }
 
@@ -128,6 +131,8 @@ export function loadConfig(instance: string): Config {
   }
 
   const codex = block.codex ?? {};
+  const allowedProjectRoot = block.allowedProjectRoot === undefined ? undefined : new ProjectScope(String(block.allowedProjectRoot)).root;
+  if (allowedProjectRoot) new ProjectScope(allowedProjectRoot).directory(projectPath);
 
   return {
     instance,
@@ -135,6 +140,7 @@ export function loadConfig(instance: string): Config {
     expectedUsername: bot.username ? String(bot.username).replace(/^@/, "") : undefined,
     allowedUserIds: parseAllowedUserIds(bot.allowedUserIds, path, instance),
     projectPath,
+    allowedProjectRoot,
     provider: oneOf(block.provider, ["codex", "claude"] as const, "codex", "provider", path, instance),
     codex: {
       sandboxMode: oneOf(
@@ -149,6 +155,7 @@ export function loadConfig(instance: string): Config {
       ),
       // По умолчанию выключено: одно сообщение на запрос, ничего лишнего.
       toolNotices: codex.toolNotices === true,
+      fileDeliveryMcp: codex.fileDeliveryMcp === true,
     },
   };
 }

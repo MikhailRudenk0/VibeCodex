@@ -1,12 +1,13 @@
-import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
-import { createReadStream, existsSync } from "fs";
-import { writeFile, unlink, stat } from "fs/promises";
-import { join } from "path";
+import { Bot, InlineKeyboard, type Context } from "grammy";
+import { existsSync } from "fs";
+import { writeFile, unlink } from "fs/promises";
 import type { Config } from "./config.js";
 import { Bridge } from "./bridge.js";
 import { CodexBridge } from "./codex/bridge.js";
 import { formatRelativeTime, type ProjectInfo } from "./projects.js";
 import { setInstanceId } from "./state.js";
+import { ProjectScope } from "./project-scope.js";
+import { sendProjectFile } from "./send-file.js";
 import { transcribeAudio } from "./transcription.js";
 
 /**
@@ -15,6 +16,7 @@ import { transcribeAudio } from "./transcription.js";
  */
 interface AgentBridge {
   projectPath: string;
+  readonly busy?: boolean;
   sessionId: string | undefined;
   model: string | undefined;
   effort: string | undefined;
@@ -31,7 +33,8 @@ interface AgentBridge {
   sendMessage(
     chatId: number,
     text: string,
-    images?: { data: string; mediaType: string }[]
+    images?: { data: string; mediaType: string }[],
+    messageThreadId?: number
   ): Promise<void>;
 }
 
@@ -62,6 +65,7 @@ export async function createBot(config: Config): Promise<Bot> {
   setInstanceId(config.instance);
 
   const bot = new Bot(config.telegramBotToken);
+  const scope = config.allowedProjectRoot ? new ProjectScope(config.allowedProjectRoot) : undefined;
 
   // Токен и рабочий каталог берутся из одного блока настроек, но сам токен мог
   // быть вписан не тот. Спрашиваем у Telegram, кто мы, и сверяем с ожиданием —
@@ -77,7 +81,7 @@ export async function createBot(config: Config): Promise<Bot> {
 
   const bridge: AgentBridge =
     config.provider === "codex"
-      ? new CodexBridge(bot.api, config.projectPath, config.codex)
+      ? new CodexBridge(bot.api, config.projectPath, { ...config.codex, allowedProjectRoot: config.allowedProjectRoot })
       : new Bridge(bot.api, config.projectPath);
 
   /**
@@ -85,7 +89,7 @@ export async function createBot(config: Config): Promise<Bot> {
    * on. A single shared list would let one user's tap land on another user's
    * project, or an old message's button point at the wrong index.
    */
-  const switchChoices = new Map<number, ProjectInfo[]>();
+  const switchChoices = new Map<string, ProjectInfo[]>();
 
   // Restore saved state (survives OOM restarts), fall back to session discovery
   const saved =
@@ -95,7 +99,7 @@ export async function createBot(config: Config): Promise<Bot> {
   if (saved?.model) bridge.model = saved.model;
   if (saved?.effort) bridge.effort = saved.effort;
 
-  const projectUsable = saved ? existsSync(saved.projectPath) : false;
+  const projectUsable = saved ? (scope?.allowsDirectory(saved.projectPath) ?? existsSync(saved.projectPath)) : false;
   if (saved && !projectUsable) {
     console.log(`Saved project ${saved.projectPath} no longer exists; keeping ${bridge.projectPath}`);
   } else if (saved) {
@@ -165,7 +169,7 @@ export async function createBot(config: Config): Promise<Bot> {
       `/projects — список проектов\n` +
       `/switch — переключить проект\n` +
       `/file <путь> — скачать файл с сервера\n\n` +
-      `Поддерживает: текст, голос, фото.`,
+      `Поддерживает: текст, голос, фото. Файлы можно попросить обычным сообщением — бот прикрепит их к чату.`,
       { parse_mode: "Markdown" }
     );
   });
@@ -242,6 +246,7 @@ export async function createBot(config: Config): Promise<Bot> {
 
   // /new command — fresh session, same project
   bot.command("new", async (ctx) => {
+    if (bridge.busy) { await ctx.reply("Сначала заверши задачу или используй /stop."); return; }
     bridge.clearSession();
     await ctx.reply("Session cleared. Next message starts a fresh conversation.");
   });
@@ -254,35 +259,11 @@ export async function createBot(config: Config): Promise<Bot> {
       return;
     }
 
-    // Resolve relative paths from the current project directory
-    const filePath = args.startsWith("/") ? args : join(bridge.projectPath, args);
-
-    let fileStats;
     try {
-      fileStats = await stat(filePath);
-    } catch {
-      await ctx.reply(`File not found: \`${filePath}\``, { parse_mode: "Markdown" });
-      return;
-    }
-
-    if (fileStats.isDirectory()) {
-      await ctx.reply("Cannot send a directory. Specify a file path.");
-      return;
-    }
-
-    // Telegram bot API limit: 50 MB
-    const sizeMB = fileStats.size / (1024 * 1024);
-    if (sizeMB > 50) {
-      await ctx.reply(`File too large (${sizeMB.toFixed(1)} MB). Telegram limit is 50 MB.`);
-      return;
-    }
-
-    try {
-      const fileName = filePath.split("/").pop() || "file";
-      await ctx.replyWithDocument(new InputFile(createReadStream(filePath), fileName));
+      await sendProjectFile(bot.api, scope ?? new ProjectScope(bridge.projectPath), ctx.chat.id,
+        bridge.projectPath, { path: args }, undefined, ctx.message?.message_thread_id);
     } catch (err: any) {
-      console.error("Failed to send file:", err);
-      await ctx.reply(`Failed to send file: ${err.message}`);
+      await ctx.reply(`Не удалось отправить файл: ${err.message}`);
     }
   });
 
@@ -319,7 +300,7 @@ export async function createBot(config: Config): Promise<Bot> {
     });
 
     const sent = await ctx.reply("Pick a project:", { reply_markup: keyboard });
-    switchChoices.set(sent.message_id, choices);
+    switchChoices.set(`${ctx.chat.id}:${sent.message_id}`, choices);
     // Keep the map from growing without bound across a long-running process.
     if (switchChoices.size > 50) {
       switchChoices.delete(switchChoices.keys().next().value!);
@@ -329,14 +310,16 @@ export async function createBot(config: Config): Promise<Bot> {
   // Handle inline keyboard callbacks for project switching
   bot.callbackQuery(/^switch:/, async (ctx) => {
     const messageId = ctx.callbackQuery.message?.message_id;
-    const choices = messageId === undefined ? undefined : switchChoices.get(messageId);
+    const choices = messageId === undefined ? undefined : switchChoices.get(`${ctx.chat?.id}:${messageId}`);
     const choice = choices?.[Number(ctx.callbackQuery.data.slice("switch:".length))];
     if (!choice) {
       await ctx.answerCallbackQuery();
       await ctx.editMessageText("Этот список устарел — вызови /switch заново.");
       return;
     }
-    const projectPath = choice.path;
+    if (bridge.busy) { await ctx.answerCallbackQuery({ text: "Сначала заверши задачу или используй /stop." }); return; }
+    if (scope && !scope.allowsDirectory(choice.path)) { await ctx.answerCallbackQuery({ text: "Проект недоступен." }); return; }
+    const projectPath = scope ? scope.directory(choice.path) : choice.path;
     bridge.projectPath = projectPath;
     const resumedId = await bridge.resumeLatestSession();
     bridge.saveState();
@@ -383,7 +366,7 @@ export async function createBot(config: Config): Promise<Bot> {
     const caption = ctx.message.caption || "What do you see in this image?";
     bridge.sendMessage(ctx.chat.id, caption, [
       { data: base64, mediaType },
-    ]).catch((err) => {
+    ], ctx.message.message_thread_id).catch((err) => {
       console.error("sendMessage error:", err);
     });
   });
@@ -432,7 +415,7 @@ export async function createBot(config: Config): Promise<Bot> {
         await ctx.reply(`🎤 ${text.slice(offset, offset + 3800)}`);
       }
 
-      bridge.sendMessage(ctx.chat.id, text).catch((err) => {
+      bridge.sendMessage(ctx.chat.id, text, undefined, ctx.message.message_thread_id).catch((err) => {
         console.error("sendMessage error:", err);
       });
     } catch (err: any) {
@@ -449,7 +432,7 @@ export async function createBot(config: Config): Promise<Bot> {
   bot.on("message:text", async (ctx) => {
     const text = ctx.message.text;
     if (!text || text.startsWith("/")) return; // Skip unhandled commands
-    bridge.sendMessage(ctx.chat.id, text).catch((err) => {
+    bridge.sendMessage(ctx.chat.id, text, undefined, ctx.message.message_thread_id).catch((err) => {
       console.error("sendMessage error:", err);
     });
   });

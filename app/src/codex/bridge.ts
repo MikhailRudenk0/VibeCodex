@@ -1,3 +1,4 @@
+import { audit } from "../audit.js";
 import type { Api, RawApi } from "grammy";
 import { writeFile, readFile, mkdir, unlink } from "fs/promises";
 import { existsSync } from "fs";
@@ -7,6 +8,11 @@ import { Streamer } from "../streamer.js";
 import type { ProjectInfo } from "../projects.js";
 import { AppServer, type AppServerNotification } from "./app-server.js";
 import { stateDir, stateFile } from "../state.js";
+import { ProjectScope } from "../project-scope.js";
+import { SEND_FILE_TOOL, FILE_DELIVERY_INSTRUCTIONS, sendProjectFile, toolResult, type ToolResult } from "../send-file.js";
+import { FileGateway } from "../file-gateway.js";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 
 /**
@@ -25,12 +31,15 @@ export interface CodexBridgeOptions {
   approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted";
   /** When true, a one-line notice per shell command is folded into the streamed reply. */
   toolNotices?: boolean;
+  allowedProjectRoot?: string;
+  fileDeliveryMcp?: boolean;
 }
 
 interface QueuedMessage {
   chatId: number;
   text: string;
   images?: { data: string; mediaType: string }[];
+  messageThreadId?: number;
 }
 
 interface SavedState {
@@ -57,7 +66,15 @@ export class CodexBridge {
 
   private readonly api: Api<RawApi>;
   private readonly server: AppServer;
-  private readonly options: Required<CodexBridgeOptions>;
+  private readonly options: Required<Omit<CodexBridgeOptions, "allowedProjectRoot">>;
+  private readonly scope?: ProjectScope;
+  private activeDelivery: { chatId: number; cwd: string; messageThreadId?: number; controller: AbortController } | null = null;
+  private fileGateway?: FileGateway;
+  private fileGatewayKey = "";
+  private fileGatewayContext?: { chatId: number; cwd: string; messageThreadId?: number };
+  private toolCalls = new Map<string, Promise<ToolResult>>();
+
+  get busy(): boolean { return this.isProcessing; }
 
   private cachedModels: ModelChoice[] = [];
   private modelEfforts = new Map<string, string[]>();
@@ -95,19 +112,35 @@ export class CodexBridge {
   constructor(api: Api<RawApi>, projectPath?: string, options: CodexBridgeOptions = {}) {
     this.api = api;
     this.projectPath = projectPath || process.cwd();
+    if (options.allowedProjectRoot) {
+      this.scope = new ProjectScope(options.allowedProjectRoot);
+      this.projectPath = this.scope.directory(this.projectPath);
+    }
     this.options = {
       sandboxMode: options.sandboxMode ?? "danger-full-access",
       approvalPolicy: options.approvalPolicy ?? "never",
       toolNotices: options.toolNotices ?? false,
+      fileDeliveryMcp: options.fileDeliveryMcp ?? false,
     };
+    if (this.scope && this.options.fileDeliveryMcp) this.fileGateway = new FileGateway(async input => {
+      const bound = this.fileGatewayContext, active = this.activeDelivery;
+      if (!this.fileGatewayKey || input.key !== this.fileGatewayKey || !bound || !active ||
+          bound.chatId !== active.chatId || bound.cwd !== active.cwd || bound.messageThreadId !== active.messageThreadId)
+        return toolResult(false, "This file tool is no longer attached to the active conversation");
+      return this.handleToolCall({ tool: "send_file", threadId: this.sessionId, turnId: this.currentTurnId,
+        callId: input.requestId, arguments: input.arguments });
+    });
     this.server = new AppServer(
       (notification) => this.handleNotification(notification),
       (message) => console.error(message),
       {
+        onToolCall: params => this.handleToolCall(params),
         onDisconnect: (error) => {
           // A dead subprocess cannot deliver turn/completed, so release the turn
           // instead of leaving the bot stuck on isProcessing forever.
+          audit("codex.disconnect", { threadId: this.sessionId });
           this.openThread = null;
+          this.activeDelivery?.controller.abort();
           if (this.finishTurn) {
             this.turnError = error.message;
             this.finishTurn();
@@ -119,7 +152,9 @@ export class CodexBridge {
 
   /** Shuts down the app-server subprocess. The bot keeps it alive; tests do not. */
   close(): void {
+    this.activeDelivery?.controller.abort();
     this.server.close();
+    void this.fileGateway?.close();
   }
 
   // ---------------------------------------------------------------- state
@@ -166,9 +201,11 @@ export class CodexBridge {
 
     const byPath = new Map<string, ProjectInfo>();
     for (const thread of threads) {
-      const path = thread?.cwd;
-      // Threads outlive their directories; a deleted path is not a project.
-      if (!path || !existsSync(path)) continue;
+      const savedPath = thread?.cwd;
+      // Canonicalize old paths too, so directory migrations can preserve history
+      // through a compatibility symlink without duplicating /switch entries.
+      if (!savedPath || !existsSync(savedPath) || (this.scope && !this.scope.allowsDirectory(savedPath))) continue;
+      const path = this.scope ? this.scope.directory(savedPath) : savedPath;
       const activity = new Date((thread.updatedAt ?? thread.createdAt ?? 0) * 1000);
       const existing = byPath.get(path);
       if (existing && existing.lastActivity >= activity) continue;
@@ -187,9 +224,14 @@ export class CodexBridge {
 
   async resumeLatestSession(): Promise<string | undefined> {
     try {
+      if (this.scope) this.projectPath = this.scope.directory(this.projectPath);
       const result = await this.server.request("thread/list", { limit: 100 });
       const match = (result?.data ?? [])
-        .filter((thread: any) => thread?.cwd === this.projectPath)
+        .filter((thread: any) => {
+          if (!this.scope) return thread?.cwd === this.projectPath;
+          return thread?.cwd && this.scope.allowsDirectory(thread.cwd) &&
+            this.scope.directory(thread.cwd) === this.projectPath;
+        })
         .sort((a: any, b: any) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0];
       this.sessionId = match?.id;
     } catch {
@@ -266,6 +308,7 @@ export class CodexBridge {
 
   async stop(): Promise<boolean> {
     if (!this.isProcessing || !this.sessionId || !this.currentTurnId) return false;
+    this.activeDelivery?.controller.abort();
     try {
       await this.server.request("turn/interrupt", {
         threadId: this.sessionId,
@@ -282,11 +325,13 @@ export class CodexBridge {
   async sendMessage(
     chatId: number,
     text: string,
-    images?: { data: string; mediaType: string }[]
+    images?: { data: string; mediaType: string }[],
+    messageThreadId?: number
   ): Promise<void> {
     if (this.isProcessing) {
       const hadPending = this.pendingMessage !== null;
-      this.pendingMessage = { chatId, text, images };
+      audit("turn.queued", { chatId, replaced: hadPending });
+      this.pendingMessage = { chatId, text, images, messageThreadId };
       await this.api.sendMessage(
         chatId,
         hadPending
@@ -296,7 +341,11 @@ export class CodexBridge {
       return;
     }
 
+    this.prepareFileConnection(chatId, messageThreadId);
+    audit("turn.accepted", { chatId, chars: text.length, threadId: this.sessionId });
     this.isProcessing = true;
+    this.activeDelivery = { chatId, cwd: this.projectPath, messageThreadId, controller: new AbortController() };
+    this.toolCalls.clear();
     this.lastUsage = null;
     this.turnError = null;
     this.streamedByItem.clear();
@@ -346,13 +395,13 @@ export class CodexBridge {
         sandboxPolicy: SANDBOX_POLICY[this.options.sandboxMode],
       });
       this.currentTurnId = turn?.turn?.id;
+      audit("turn.started", { threadId: this.sessionId, turnId: this.currentTurnId });
       if (this.currentTurnId && this.finishedTurnIds.has(this.currentTurnId)) {
         this.finishTurn?.();
       }
 
       this.armIdleWatchdog();
       await turnEnded;
-
       if (this.turnError) this.queueAppend(`\n\nError: ${this.turnError}`);
       statusLine = this.buildStatusLine();
     } catch (err: any) {
@@ -361,17 +410,25 @@ export class CodexBridge {
       this.clearIdleWatchdog();
       this.finishTurn = null;
       // Drain queued appends before closing the message, or the tail is lost.
-      await this.appendChain.catch(() => {});
-      await streamer.finalize(statusLine);
+      audit("turn.finalizing", { threadId: this.sessionId, turnId: this.currentTurnId });
+      try {
+        await this.appendChain.catch(() => {});
+        await streamer.finalize(statusLine);
+      } catch (err) {
+        audit("turn.delivery_failed", { errorType: (err as Error).name });
+      }
       this.currentStreamer = null;
+      audit("turn.finished", { threadId: this.sessionId, turnId: this.currentTurnId });
       this.currentTurnId = undefined;
+      this.activeDelivery?.controller.abort();
+      this.activeDelivery = null;
       this.isProcessing = false;
       for (const path of tempImages) await unlink(path).catch(() => {});
 
       const next = this.pendingMessage;
       if (next) {
         this.pendingMessage = null;
-        this.sendMessage(next.chatId, next.text, next.images).catch((err) => {
+        this.sendMessage(next.chatId, next.text, next.images, next.messageThreadId).catch((err) => {
           console.error("Queued sendMessage error:", err);
         });
       }
@@ -380,7 +437,24 @@ export class CodexBridge {
 
   // ------------------------------------------------------------- internals
 
+  private prepareFileConnection(chatId: number, messageThreadId?: number): void {
+    if (this.scope) this.projectPath = this.scope.directory(this.projectPath);
+    const bound = this.fileGatewayContext;
+    if (!bound || (bound.chatId === chatId && bound.cwd === this.projectPath &&
+        bound.messageThreadId === messageThreadId && this.openThread?.id === this.sessionId)) return;
+
+    // A loaded thread retains its MCP process even when thread/resume receives
+    // new configuration. Rotate the app-server before arming the next turn, so
+    // returning to that thread cannot reuse its old gateway key. History stays
+    // on disk and is resumed normally; previous destinations remain revoked.
+    this.fileGatewayKey = "";
+    this.fileGatewayContext = undefined;
+    this.server.close();
+    this.openThread = null;
+  }
+
   private async ensureThread(): Promise<void> {
+    if (this.scope) this.projectPath = this.scope.directory(this.projectPath);
     await this.server.start();
 
     // A thread already open in this app-server needs nothing: resuming it again
@@ -394,11 +468,33 @@ export class CodexBridge {
       return;
     }
 
+    const fileConfig: Record<string, any> = {};
+    if (this.fileGateway) {
+      this.fileGatewayKey = randomUUID();
+      const active = this.activeDelivery;
+      this.fileGatewayContext = active ? { chatId: active.chatId, cwd: active.cwd, messageThreadId: active.messageThreadId } : undefined;
+      fileConfig["mcp_servers.vibecodex_files"] = {
+        command: process.execPath,
+        args: [fileURLToPath(new URL("../../../node_modules/tsx/dist/cli.mjs", import.meta.url)),
+          fileURLToPath(new URL("../file-mcp.ts", import.meta.url))],
+        env: { VIBECODEX_FILE_SOCKET: await this.fileGateway.start(), VIBECODEX_FILE_KEY: this.fileGatewayKey },
+        startup_timeout_sec: 20, tool_timeout_sec: 150, enabled: true, required: true,
+      };
+    }
+
     if (this.sessionId) {
       try {
+        if (this.scope) {
+          const saved = await this.server.request("thread/read", { threadId: this.sessionId, includeTurns: false });
+          if (this.scope.directory(saved?.thread?.cwd ?? "") !== this.projectPath) {
+            throw new Error("Saved session belongs to another project");
+          }
+        }
         await this.server.request("thread/resume", {
           threadId: this.sessionId,
           cwd: this.projectPath,
+          ...(this.scope ? { developerInstructions: FILE_DELIVERY_INSTRUCTIONS } : {}),
+          ...(this.fileGateway ? { config: fileConfig } : {}),
         });
         this.openThread = { id: this.sessionId, generation: this.server.generation };
         return;
@@ -412,6 +508,8 @@ export class CodexBridge {
       cwd: this.projectPath,
       approvalPolicy: this.options.approvalPolicy,
       sandbox: this.options.sandboxMode,
+      ...(this.scope ? { developerInstructions: FILE_DELIVERY_INSTRUCTIONS,
+        ...(this.fileGateway ? { config: fileConfig } : { dynamicTools: [SEND_FILE_TOOL] }) } : {}),
       ...(this.model ? { model: this.model } : {}),
     });
     this.sessionId = result?.thread?.id;
@@ -429,12 +527,43 @@ export class CodexBridge {
     return path;
   }
 
+  private async handleToolCall(params: Record<string, any>): Promise<ToolResult> {
+    const context = this.activeDelivery;
+    if (params.tool !== "send_file" || params.namespace || !this.scope) return toolResult(false, "Unknown tool");
+    if (!context || context.controller.signal.aborted || !this.isProcessing || !this.finishTurn ||
+        !this.currentTurnId || params.threadId !== this.sessionId || params.turnId !== this.currentTurnId ||
+        typeof params.callId !== "string" || !params.callId) {
+      return toolResult(false, "File delivery is only available in the current active Telegram turn");
+    }
+    const key = `${params.threadId}:${params.turnId}:${params.callId}`;
+    const previous = this.toolCalls.get(key);
+    if (previous) return previous;
+    const delivery = sendProjectFile(this.api, this.scope, context.chatId, context.cwd, params.arguments, context.controller.signal, context.messageThreadId)
+      .then(sent => toolResult(true, JSON.stringify({ delivered: true, ...sent })))
+      .catch((error: Error) => toolResult(false, error.message));
+    this.toolCalls.set(key, delivery);
+    return delivery;
+  }
+
   private handleNotification({ method, params }: AppServerNotification): void {
-    if (params.threadId && this.sessionId && params.threadId !== this.sessionId) return;
+    if (params.threadId && this.sessionId && params.threadId !== this.sessionId) {
+      audit("codex.dropped_event", { method, threadId: params.threadId, expectedThreadId: this.sessionId });
+      return;
+    }
     if (this.idleTimer) this.armIdleWatchdog();
     const streamer = this.currentStreamer;
+    // Deltas are intentionally excluded: log lifecycle and metadata, never content.
+    if (method !== "item/agentMessage/delta") audit("codex.event", {
+      method, threadId: params.threadId, turnId: params.turn?.id ?? params.turnId,
+      itemId: params.item?.id, itemType: params.item?.type, status: params.turn?.status,
+      willRetry: params.willRetry,
+    });
 
     switch (method) {
+      case "turn/started": {
+        if (this.isProcessing && this.finishTurn) this.currentTurnId = params.turn?.id ?? params.turnId;
+        return;
+      }
       case "item/agentMessage/delta": {
         if (!streamer || !params.delta) return;
         const itemId: string = params.itemId ?? "";
@@ -524,6 +653,7 @@ export class CodexBridge {
     this.clearIdleWatchdog();
     this.idleTimer = setTimeout(() => {
       if (!this.finishTurn) return;
+      audit("turn.idle_timeout", { threadId: this.sessionId, turnId: this.currentTurnId });
       this.turnError = "Codex молчит 15 минут — ход прерван";
       this.finishTurn();
     }, 15 * 60_000);

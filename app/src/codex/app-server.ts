@@ -1,3 +1,4 @@
+import { audit } from "../audit.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import { createInterface, type Interface } from "readline";
 
@@ -25,6 +26,8 @@ export interface AppServerOptions {
    * without this.
    */
   onDisconnect?: (error: Error) => void;
+  /** Host-implemented tools; never treated as approval requests. */
+  onToolCall?: (params: Record<string, any>) => Promise<unknown>;
 }
 
 /**
@@ -95,9 +98,14 @@ export class AppServer {
   private async spawnAndInitialize(): Promise<void> {
     const command = this.options.command ?? "codex";
     this.spawnCount++;
+    const env = { ...(this.options.env ?? process.env) };
+    // The host implements Telegram delivery; the agent does not need bot credentials.
+    delete env.CREDENTIALS_DIRECTORY;
+    delete env.VIBECODEX_CONFIG;
+    delete env.TELEGRAM_BOT_TOKEN;
     const proc = spawn(command, ["app-server"], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: this.options.env ?? process.env,
+      env,
     }) as ChildProcessWithoutNullStreams;
 
     this.proc = proc;
@@ -147,6 +155,7 @@ export class AppServer {
    */
   private dispatch(method: string, params: Record<string, any>, timeoutMs: number): Promise<any> {
     const id = this.nextId++;
+    audit("rpc.request", { id, method });
     let settle!: { resolve: (value: any) => void; reject: (error: Error) => void };
     const response = new Promise<any>((resolve, reject) => {
       settle = { resolve, reject };
@@ -154,6 +163,7 @@ export class AppServer {
 
     const timer = setTimeout(() => {
       this.pending.delete(id);
+      audit("rpc.timeout", { id, method });
       settle.reject(new AppServerError(`app-server request timed out: ${method}`));
     }, timeoutMs);
     this.pending.set(id, { ...settle, timer });
@@ -185,6 +195,7 @@ export class AppServer {
       if (!entry) return;
       this.pending.delete(message.id);
       clearTimeout(entry.timer);
+      audit("rpc.response", { id: message.id, failed: Boolean(message.error) });
       if (message.error) {
         const detail = message.error?.message ?? JSON.stringify(message.error);
         entry.reject(new AppServerError(detail));
@@ -195,14 +206,37 @@ export class AppServer {
     }
 
     if (message.method && message.id !== undefined && message.id !== null) {
+      if (message.method === "item/tool/call") {
+        const proc = this.proc;
+        const respond = (result: unknown) => {
+          // A late upload result must never be written into a replacement server.
+          if (this.proc !== proc || !proc?.stdin.writable) return;
+          try { this.write({ id: message.id, result }); } catch { /* disconnected */ }
+        };
+        void Promise.resolve().then(() => {
+          if (!this.options.onToolCall) throw new Error("Dynamic tools are unavailable");
+          return this.options.onToolCall(message.params ?? {});
+        }).then(respond).catch(() => respond({
+          success: false,
+          contentItems: [{ type: "inputText", text: "Tool failed. Delivery was not confirmed; do not claim success or automatically retry." }],
+        }));
+        return;
+      }
       // Server asks us something. We run with approvals disabled, so anything
       // arriving here is unexpected — decline rather than hang the turn.
+      audit("rpc.approval_declined", { method: message.method });
       this.log(`declining app-server request: ${message.method}`);
       this.write({ id: message.id, result: { decision: "decline" } });
       return;
     }
 
     if (message.method) {
+      const p = message.params ?? {};
+      if (!message.method.endsWith("Delta") && !message.method.endsWith("/delta")) {
+        audit("rpc.notification", { method: message.method, threadId: p.threadId,
+          turnId: p.turn?.id ?? p.turnId, status: p.turn?.status,
+          itemType: p.item?.type, phase: p.item?.phase });
+      }
       try {
         this.onNotification({ method: message.method, params: message.params ?? {} });
       } catch (err) {

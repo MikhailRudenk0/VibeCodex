@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-11-22T19:09:26+01:00 — Restore file delivery after returning to a project
+
+- Reproduced the user's failure with a real installed app-server: a file
+  upload works in project A, works in B, and fails on returning to the saved
+  conversation in A before any Telegram request. A loaded thread retains
+  its original MCP process and environment despite new thread/resume config.
+- `app/src/codex/bridge.ts`: invalidate the old gateway and restart app-server
+  before binding the next active turn when the thread, project, chat or topic
+  changes. Resume the saved conversation without deleting history. Reuse the
+  connection for consecutive turns in the same context. Keep stale-key,
+  recipient, active-turn, cancellation and file-boundary checks intact.
+- `test/file-delivery-switch.ts`: eight mocked uploads through public
+  sendMessage and the actual private gateway, including returns to both
+  projects, a fresh conversation, chat/topic changes and connection reuse.
+  `test/file-mcp-switch-live.ts`: real app-server regression with one minimal
+  model turn to persist a conversation; Telegram is mocked. Without that turn
+  an unsaved conversation is replaced, which does not reproduce the defect.
+- The existing local automatic-file-delivery implementation was not yet fully
+  tracked. Include its required scope/gateway/MCP modules, configuration,
+  host-tool RPC, bot integration and relevant tests so the fix is reproducible.
+  These dependencies predate this task; their original edit times are unknown.
+  Independent pending voice/download and text-recovery changes are excluded.
+- `docs/FILE_DELIVERY.md`: routing contract, cause, correction, regression
+  commands, model usage, and restart requirements. No credentials, live chat
+  IDs, model transcripts or private files are committed.
+- Working-tree checks passed: TypeScript, file-delivery-switch, file-delivery,
+  file-gateway, dynamic-tool-protocol and config. The persisted-project probe
+  changed from two mock uploads plus one rejection to three successful uploads,
+  retaining the original conversation ID. Final isolated verification completed
+  at **2026-11-22T19:10:55+01:00**: the same TypeScript and five offline scripts passed,
+  and the real app-server regression again delivered three mock files while
+  retaining the saved conversation. No real Telegram upload was attempted by
+  these tests; actual screenshot delivery remains pending after restart.
+- Status: code prepared; applying it requires a deferred restart of the current
+  projects bot after the reply. Do not claim the user's PNGs delivered based on
+  fake Telegram tests. Timestamp is the completion of the implementation and
+  working-tree verification, read from the Europe/Berlin system clock.
+
 ## 2026-11-10 — Local voice recognition repair
 
 - Investigation found that the running bot used an old, ignored
