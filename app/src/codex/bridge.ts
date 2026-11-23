@@ -243,10 +243,12 @@ export class CodexBridge {
   // --------------------------------------------------------------- models
 
   async getSupportedModels(): Promise<ModelChoice[]> {
-    if (this.cachedModels.length > 0) return this.cachedModels;
+    // /model must discover newly released models in a long-lived bot. Keep the
+    // previous catalog only as a fallback when the read-only RPC is unavailable.
     try {
-      const result = await this.server.request("model/list", {});
+      const result = await this.server.request("model/list", { limit: 100 });
       const available = (result?.data ?? []).filter((model: any) => !model.hidden);
+      this.modelEfforts.clear();
       for (const model of available) {
         const id = model.id ?? model.model;
         const efforts = (model.supportedReasoningEfforts ?? [])
@@ -262,7 +264,7 @@ export class CodexBridge {
         .filter((model: ModelChoice) => model.value);
       return this.cachedModels;
     } catch {
-      return [];
+      return this.cachedModels;
     }
   }
 
